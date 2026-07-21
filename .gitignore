@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Prisma-generated files
+server/src/generated/prisma/
+
+# Build and test output
+dist/
+build/
+coverage/
+
+# Postman local files and exported requests
+.postman/
+postman/
+
+# Logs
+*.log
+npm-debug.log*
