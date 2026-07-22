@@ -22,9 +22,18 @@ enum OrderStatus {
 
 enum PaymentStatus {
   PENDING
+  VERIFYING
   SUCCESS
   FAILED
   CANCELLED
+}
+
+enum CallbackProcessingStatus {
+  RECEIVED
+  PROCESSED
+  REJECTED
+  UNMATCHED
+  ERROR
 }
 
 model User {
@@ -84,8 +93,9 @@ model Order {
   totalAmount Decimal     @db.Decimal(10, 2)
   status      OrderStatus @default(PENDING)
 
-  items   OrderItem[]
-  payment Payment?
+  items           OrderItem[]
+  payment         Payment?
+  paymentAttempts PaymentAttempt[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -125,14 +135,76 @@ model Payment {
   phoneNumber        String
   merchantRequestId  String?
   checkoutRequestId  String? @unique
-  mpesaReceiptNumber String?
+  mpesaReceiptNumber String? @unique
   resultCode         String?
   resultDescription  String?
 
-  paidAt    DateTime?
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
+  verifiedAt DateTime?
+  paidAt     DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
 
   @@index([status])
+}
+
+model PaymentAttempt {
+  id String @id @default(cuid())
+
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  method String        @default("MPESA")
+  status PaymentStatus @default(PENDING)
+  amount Decimal       @db.Decimal(10, 2)
+
+  phoneNumber      String
+  accountReference String?
+
+  merchantRequestId String? @unique
+  checkoutRequestId String? @unique
+
+  mpesaReceiptNumber String? @unique
+
+  initiationResponseCode        String?
+  initiationResponseDescription String?
+
+  resultCode        String?
+  resultDescription String?
+
+  callbackReceivedAt DateTime?
+  verifiedAt         DateTime?
+  paidAt             DateTime?
+
+  callbackEvents MpesaCallbackEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([orderId, createdAt])
+  @@index([status])
+}
+
+model MpesaCallbackEvent {
+  id String @id @default(cuid())
+
+  paymentAttemptId String?
+  paymentAttempt   PaymentAttempt? @relation(fields: [paymentAttemptId], references: [id], onDelete: SetNull)
+
+  eventKey String @unique
+
+  merchantRequestId String?
+  checkoutRequestId String?
+  resultCode        String?
+
+  payload Json
+
+  processingStatus CallbackProcessingStatus @default(RECEIVED)
+  errorMessage     String?
+  sourceIp         String?
+
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+
   @@index([checkoutRequestId])
+  @@index([processingStatus, receivedAt])
 }
