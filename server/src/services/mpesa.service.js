@@ -140,8 +140,14 @@ export const getMpesaAccessToken = async () => {
   const currentTime = Date.now();
 
   if (cachedAccessToken && currentTime < cachedAccessTokenExpiresAt) {
+    const remainingExpiresInSeconds = Math.max(
+      1,
+      Math.floor((cachedAccessTokenExpiresAt - currentTime) / 1000),
+    );
+
     return {
       accessToken: cachedAccessToken,
+      expiresIn: remainingExpiresInSeconds,
       cached: true,
     };
   }
