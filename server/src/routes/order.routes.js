@@ -96,6 +96,74 @@ const updateOrderStatusSchema = z
 
 /*
 |--------------------------------------------------------------------------
+| Admin order-list query validation
+|--------------------------------------------------------------------------
+|
+| Only recognised query parameters are accepted.
+| Large page sizes and extreme offsets are rejected.
+*/
+
+const adminOrderPageSchema = z.preprocess(
+  (value) => {
+    if (value === undefined) {
+      return 1;
+    }
+
+    if (typeof value === "string" && /^\d+$/.test(value)) {
+      return Number(value);
+    }
+
+    return value;
+  },
+
+  z
+    .number()
+    .int("Page must be a whole number.")
+    .min(1, "Page must be at least 1.")
+    .max(1000, "Page cannot exceed 1000."),
+);
+
+const adminOrderLimitSchema = z.preprocess(
+  (value) => {
+    if (value === undefined) {
+      return 20;
+    }
+
+    if (typeof value === "string" && /^\d+$/.test(value)) {
+      return Number(value);
+    }
+
+    return value;
+  },
+
+  z
+    .number()
+    .int("Limit must be a whole number.")
+    .min(1, "Limit must be at least 1.")
+    .max(50, "Limit cannot exceed 50 orders per request."),
+);
+
+const adminOrderListQuerySchema = z
+  .object({
+    page: adminOrderPageSchema,
+
+    limit: adminOrderLimitSchema,
+
+    status: z
+      .enum([
+        "PENDING",
+        "PAID",
+        "PROCESSING",
+        "SHIPPED",
+        "DELIVERED",
+        "CANCELLED",
+      ])
+      .optional(),
+  })
+  .strict();
+
+/*
+|--------------------------------------------------------------------------
 | Safe order-status transitions
 |--------------------------------------------------------------------------
 |
@@ -148,6 +216,18 @@ const createOrderLimiter = rateLimit({
   message: {
     success: false,
     message: "Too many order requests. Please wait before trying again.",
+  },
+});
+
+const adminOrderReadLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  message: {
+    success: false,
+    message: "Too many admin order requests. Please wait before trying again.",
   },
 });
 
@@ -271,6 +351,67 @@ const orderResponseInclude = {
 const adminOrderResponseInclude = {
   ...orderResponseInclude,
   payment: true,
+};
+
+/*
+|--------------------------------------------------------------------------
+| Admin order-list response
+|--------------------------------------------------------------------------
+|
+| Select only the fields needed by the admin dashboard.
+|
+| Internal fields such as idempotencyKey and requestFingerprint are not
+| returned in the order-list response.
+*/
+
+const adminOrderListSelect = {
+  id: true,
+
+  customerName: true,
+  customerEmail: true,
+  customerPhone: true,
+
+  totalAmount: true,
+  status: true,
+
+  processingStartedAt: true,
+  shippedAt: true,
+  deliveredAt: true,
+  cancelledAt: true,
+  stockRestoredAt: true,
+
+  createdAt: true,
+  updatedAt: true,
+
+  items: {
+    select: {
+      quantity: true,
+      price: true,
+
+      product: {
+        select: {
+          id: true,
+          name: true,
+          slug: true,
+          imageUrl: true,
+        },
+      },
+    },
+  },
+
+  payment: {
+    select: {
+      method: true,
+      status: true,
+      amount: true,
+
+      mpesaReceiptNumber: true,
+      resultCode: true,
+
+      verifiedAt: true,
+      paidAt: true,
+    },
+  },
 };
 
 const runSerializableTransactionWithRetry = async (
@@ -639,48 +780,113 @@ router.post("/", createOrderLimiter, async (req, res) => {
 |--------------------------------------------------------------------------
 | GET /api/orders/admin/all
 |--------------------------------------------------------------------------
-| Admins can view all orders.
+| Returns a limited, paginated list of orders.
+|
+| Supported query parameters:
+| - page
+| - limit
+| - status
 */
 
-router.get("/admin/all", protect, adminOnly, async (req, res) => {
-  try {
-    const orders = await prisma.order.findMany({
-      include: {
-        items: {
-          include: {
-            product: {
-              select: {
-                id: true,
-                name: true,
-                slug: true,
-                imageUrl: true,
-              },
+router.get(
+  "/admin/all",
+  protect,
+  adminOnly,
+  adminOrderReadLimiter,
+  async (req, res) => {
+    try {
+      const validationResult = adminOrderListQuerySchema.safeParse(req.query);
+
+      if (!validationResult.success) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid order-list query.",
+
+          errors: formatValidationErrors(validationResult.error.issues),
+        });
+      }
+
+      const { page, limit, status } = validationResult.data;
+
+      const skip = (page - 1) * limit;
+
+      const where = status
+        ? {
+            status,
+          }
+        : {};
+
+      /*
+       * Count and retrieve the requested page together.
+       */
+      const [totalOrders, orders] = await prisma.$transaction([
+        prisma.order.count({
+          where,
+        }),
+
+        prisma.order.findMany({
+          where,
+
+          skip,
+          take: limit,
+
+          select: adminOrderListSelect,
+
+          /*
+           * createdAt provides chronological sorting.
+           * id gives deterministic ordering when timestamps match.
+           */
+          orderBy: [
+            {
+              createdAt: "desc",
             },
-          },
+            {
+              id: "desc",
+            },
+          ],
+        }),
+      ]);
+
+      const totalPages = totalOrders === 0 ? 0 : Math.ceil(totalOrders / limit);
+
+      return res.status(200).json({
+        success: true,
+
+        filters: {
+          status: status || null,
         },
 
-        payment: true,
-      },
+        pagination: {
+          page,
+          limit,
 
-      orderBy: {
-        createdAt: "desc",
-      },
-    });
+          totalOrders,
+          totalPages,
 
-    return res.status(200).json({
-      success: true,
-      count: orders.length,
-      orders,
-    });
-  } catch (error) {
-    console.error("Get orders error:", error);
+          returnedOrders: orders.length,
 
-    return res.status(500).json({
-      success: false,
-      message: "Failed to retrieve orders.",
-    });
-  }
-});
+          hasPreviousPage: page > 1,
+
+          hasNextPage: page < totalPages,
+        },
+
+        orders,
+      });
+    } catch (error) {
+      console.error("Get paginated orders error:", {
+        name: error.name,
+        code: error.code,
+        message: error.message,
+      });
+
+      return res.status(500).json({
+        success: false,
+
+        message: "Failed to retrieve orders safely.",
+      });
+    }
+  },
+);
 
 /*
 |--------------------------------------------------------------------------
