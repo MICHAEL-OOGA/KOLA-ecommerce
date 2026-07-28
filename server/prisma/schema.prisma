@@ -93,9 +93,18 @@ model Order {
   totalAmount Decimal     @db.Decimal(10, 2)
   status      OrderStatus @default(PENDING)
 
+  idempotencyKey     String? @unique @db.VarChar(128)
+  requestFingerprint String? @db.VarChar(64)
+
   items           OrderItem[]
   payment         Payment?
   paymentAttempts PaymentAttempt[]
+
+  processingStartedAt DateTime?
+  shippedAt           DateTime?
+  deliveredAt         DateTime?
+  cancelledAt         DateTime?
+  stockRestoredAt     DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
