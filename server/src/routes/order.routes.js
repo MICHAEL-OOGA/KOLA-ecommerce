@@ -1,11 +1,12 @@
 import express from "express";
-import { success, z } from "zod";
-import { Prisma } from "@prisma/client";
+import { z } from "zod";
+import PrismaPackage from "@prisma/client";
 import rateLimit from "express-rate-limit";
 import prisma from "../config/prisma.js";
 import { createHash } from "node:crypto";
 import { protect, adminOnly } from "../middleware/auth.middleware.js";
-
+import { getOrderExpiryDate } from "../services/order-expiry.service.js";
+const { Prisma } = PrismaPackage;
 const router = express.Router();
 
 /*
@@ -157,6 +158,7 @@ const adminOrderListQuerySchema = z
         "SHIPPED",
         "DELIVERED",
         "CANCELLED",
+        "EXPIRED",
       ])
       .optional(),
   })
@@ -178,6 +180,7 @@ const ORDER_STATUS_TRANSITIONS = Object.freeze({
   SHIPPED: ["DELIVERED"],
   DELIVERED: [],
   CANCELLED: [],
+  EXPIRED: [],
 });
 
 const getStatusTimestampData = (requestedStatus, timestamp) => {
@@ -379,6 +382,8 @@ const adminOrderListSelect = {
   deliveredAt: true,
   cancelledAt: true,
   stockRestoredAt: true,
+  expiresAt: true,
+  expiredAt: true,
 
   createdAt: true,
   updatedAt: true,
@@ -679,6 +684,8 @@ router.post("/", createOrderLimiter, async (req, res) => {
 
             totalAmount,
             status: "PENDING",
+
+            expiresAt: getOrderExpiryDate(),
 
             idempotencyKey,
             requestFingerprint,
