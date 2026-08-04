@@ -48,6 +48,20 @@ const readJwtSecret = () => {
   return secret;
 };
 
+const readCsrfSecret = () => {
+  const secret = process.env.CSRF_SECRET?.trim();
+
+  if (!secret) {
+    throw new Error("CSRF_SECRET is required.");
+  }
+
+  if (Buffer.byteLength(secret, "utf8") < 32) {
+    throw new Error("CSRF_SECRET must contain at least 32 bytes.");
+  }
+
+  return secret;
+};
+
 const readSameSiteSetting = () => {
   const value =
     process.env.AUTH_COOKIE_SAME_SITE?.trim().toLowerCase() || "lax";
@@ -62,6 +76,8 @@ const readSameSiteSetting = () => {
 };
 
 export const JWT_SECRET = readJwtSecret();
+
+export const CSRF_SECRET = readCsrfSecret();
 
 export const JWT_ALGORITHM = "HS256";
 
@@ -79,6 +95,12 @@ export const AUTH_SESSION_MINUTES = readBoundedIntegerEnv(
 );
 
 export const AUTH_SESSION_SECONDS = AUTH_SESSION_MINUTES * 60;
+export const AUTH_MAX_ACTIVE_SESSIONS = readBoundedIntegerEnv(
+  "AUTH_MAX_ACTIVE_SESSIONS",
+  5,
+  1,
+  20,
+);
 
 const isProduction = process.env.NODE_ENV === "production";
 

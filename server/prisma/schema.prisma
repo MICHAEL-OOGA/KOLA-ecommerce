@@ -37,6 +37,26 @@ enum CallbackProcessingStatus {
   ERROR
 }
 
+model AuthSession {
+  id String @id @default(cuid())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  jwtId String @unique @db.VarChar(36)
+
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  revocationReason String? @db.VarChar(100)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, revokedAt, expiresAt])
+  @@index([expiresAt])
+}
+
 model User {
   id       String  @id @default(cuid())
   fullName String
@@ -44,7 +64,9 @@ model User {
   phone    String?
   password String
   role     Role    @default(CUSTOMER)
+
   orders   Order[]
+  sessions AuthSession[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

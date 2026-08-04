@@ -11,12 +11,6 @@ import {
   getAuthCookieClearOptions,
 } from "../config/auth.config.js";
 
-/*
-|--------------------------------------------------------------------------
-| Authentication middleware
-|--------------------------------------------------------------------------
-*/
-
 export const protect = async (req, res, next) => {
   try {
     const token = req.cookies?.[AUTH_COOKIE_NAME];
@@ -24,76 +18,84 @@ export const protect = async (req, res, next) => {
     if (!token) {
       return res.status(401).json({
         success: false,
-
         message: "Authentication required.",
       });
     }
 
-    const decoded = jwt.verify(
-      token,
-      JWT_SECRET,
+    const decoded = jwt.verify(token, JWT_SECRET, {
+      algorithms: [JWT_ALGORITHM],
 
-      {
-        algorithms: [JWT_ALGORITHM],
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
 
-        issuer: JWT_ISSUER,
-        audience: JWT_AUDIENCE,
+      maxAge: AUTH_SESSION_SECONDS,
 
-        maxAge: AUTH_SESSION_SECONDS,
+      clockTolerance: 5,
+    });
 
-        clockTolerance: 5,
-      },
-    );
-
-    /*
-     * jwt.verify may technically return a string or an object.
-     * Our authentication token must be an object with the expected claims.
-     */
     if (
       !decoded ||
       typeof decoded !== "object" ||
       typeof decoded.sub !== "string" ||
+      typeof decoded.jti !== "string" ||
       decoded.tokenType !== "access"
     ) {
-      throw new Error("Unexpected token payload.");
+      throw new Error("Unexpected authentication token.");
     }
 
-    const user = await prisma.user.findUnique({
+    /*
+     * Retrieve the database session using the JWT ID.
+     */
+    const session = await prisma.authSession.findUnique({
       where: {
-        id: decoded.sub,
+        jwtId: decoded.jti,
       },
 
-      select: {
-        id: true,
-        fullName: true,
-        email: true,
-        phone: true,
-        role: true,
-        createdAt: true,
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            phone: true,
+            role: true,
+            createdAt: true,
+          },
+        },
       },
     });
 
-    if (!user) {
-      throw new Error("Authenticated user does not exist.");
+    const currentTime = new Date();
+
+    /*
+     * Reject missing, revoked, mismatched or expired sessions.
+     */
+    if (
+      !session ||
+      session.userId !== decoded.sub ||
+      session.revokedAt ||
+      session.expiresAt <= currentTime
+    ) {
+      throw new Error("Authentication session is inactive.");
     }
 
-    req.user = user;
+    req.user = session.user;
 
+    /*
+     * These three values are required by createCsrfToken().
+     */
     req.auth = {
-      userId: user.id,
-      jwtId: typeof decoded.jti === "string" ? decoded.jti : null,
+      sessionId: session.id,
+
+      jwtId: session.jwtId,
 
       issuedAt: typeof decoded.iat === "number" ? decoded.iat : null,
 
-      expiresAt: typeof decoded.exp === "number" ? decoded.exp : null,
+      expiresAt: session.expiresAt,
     };
 
     return next();
-  } catch (error) {
-    /*
-     * Remove invalid or expired authentication cookies so that the
-     * browser does not repeatedly send them.
-     */
+  } catch {
     res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
 
     return res.status(401).json({
@@ -104,17 +106,10 @@ export const protect = async (req, res, next) => {
   }
 };
 
-/*
-|--------------------------------------------------------------------------
-| Admin authorization
-|--------------------------------------------------------------------------
-*/
-
 export const adminOnly = (req, res, next) => {
   if (!req.user || req.user.role !== "ADMIN") {
     return res.status(403).json({
       success: false,
-
       message: "Admin access is required.",
     });
   }

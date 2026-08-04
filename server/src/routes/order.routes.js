@@ -6,6 +6,7 @@ import prisma from "../config/prisma.js";
 import { createHash } from "node:crypto";
 import { protect, adminOnly } from "../middleware/auth.middleware.js";
 import { getOrderExpiryDate } from "../services/order-expiry.service.js";
+import { requireCsrf } from "../middleware/csrf.middleware.js";
 const { Prisma } = PrismaPackage;
 const router = express.Router();
 
@@ -968,181 +969,246 @@ router.get("/admin/:id", protect, adminOnly, async (req, res) => {
 | Cancelling an unpaid order restores its reserved stock exactly once.
 */
 
-router.patch("/admin/:id/status", protect, adminOnly, async (req, res) => {
-  try {
-    const { id } = req.params;
+router.patch(
+  "/admin/:id/status",
+  protect,
+  adminOnly,
+  requireCsrf,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
 
-    const result = updateOrderStatusSchema.safeParse(req.body);
+      const result = updateOrderStatusSchema.safeParse(req.body);
 
-    if (!result.success) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid order status.",
+      if (!result.success) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid order status.",
 
-        errors: formatValidationErrors(result.error.issues),
-      });
-    }
-
-    const requestedStatus = result.data.status;
-
-    const statusChangeResult = await runSerializableTransactionWithRetry(
-      async (transaction) => {
-        const existingOrder = await transaction.order.findUnique({
-          where: {
-            id,
-          },
-
-          include: {
-            items: true,
-            payment: true,
-          },
+          errors: formatValidationErrors(result.error.issues),
         });
+      }
 
-        if (!existingOrder) {
-          throw new OrderRequestError(
-            404,
-            "ORDER_NOT_FOUND",
-            "Order not found.",
-          );
-        }
+      const requestedStatus = result.data.status;
 
-        /*
-         * Repeating the same status request is harmless.
-         *
-         * This also prevents repeated cancellation requests from
-         * restoring stock more than once.
-         */
-        if (existingOrder.status === requestedStatus) {
-          const unchangedOrder = await transaction.order.findUnique({
+      const statusChangeResult = await runSerializableTransactionWithRetry(
+        async (transaction) => {
+          const existingOrder = await transaction.order.findUnique({
             where: {
               id,
             },
 
-            include: adminOrderResponseInclude,
+            include: {
+              items: true,
+              payment: true,
+            },
           });
 
-          return {
-            order: unchangedOrder,
-            unchanged: true,
-            stockRestored: false,
-          };
-        }
-
-        const allowedNextStatuses =
-          ORDER_STATUS_TRANSITIONS[existingOrder.status] || [];
-
-        if (!allowedNextStatuses.includes(requestedStatus)) {
-          throw new OrderRequestError(
-            409,
-            "INVALID_ORDER_STATUS_TRANSITION",
-            `An order cannot move from ${existingOrder.status} to ${requestedStatus}.`,
-          );
-        }
-
-        const statusChangedAt = new Date();
-
-        /*
-         * Cancelling a PENDING order restores the stock that was
-         * reserved during order creation.
-         */
-        if (requestedStatus === "CANCELLED") {
-          if (existingOrder.payment?.status === "SUCCESS") {
+          if (!existingOrder) {
             throw new OrderRequestError(
-              409,
-              "PAID_ORDER_CANNOT_BE_CANCELLED",
-              "A paid order cannot be cancelled without completing a refund workflow.",
+              404,
+              "ORDER_NOT_FOUND",
+              "Order not found.",
             );
           }
 
           /*
-           * Do not cancel while an M-Pesa request is unresolved.
+           * Repeating the same status request is harmless.
            *
-           * Safaricom could still complete the transaction and send
-           * its callback.
+           * This also prevents repeated cancellation requests from
+           * restoring stock more than once.
            */
-          const unresolvedPaymentAttempt =
-            await transaction.paymentAttempt.findFirst({
+          if (existingOrder.status === requestedStatus) {
+            const unchangedOrder = await transaction.order.findUnique({
               where: {
-                orderId: existingOrder.id,
-
-                status: {
-                  in: ["PENDING", "VERIFYING"],
-                },
+                id,
               },
 
-              select: {
-                id: true,
-                status: true,
-              },
+              include: adminOrderResponseInclude,
             });
 
-          if (unresolvedPaymentAttempt) {
+            return {
+              order: unchangedOrder,
+              unchanged: true,
+              stockRestored: false,
+            };
+          }
+
+          const allowedNextStatuses =
+            ORDER_STATUS_TRANSITIONS[existingOrder.status] || [];
+
+          if (!allowedNextStatuses.includes(requestedStatus)) {
             throw new OrderRequestError(
               409,
-              "PAYMENT_STILL_PROCESSING",
-              "This order has an unresolved payment request and cannot be cancelled yet.",
+              "INVALID_ORDER_STATUS_TRANSITION",
+              `An order cannot move from ${existingOrder.status} to ${requestedStatus}.`,
             );
           }
 
-          /*
-           * The conditional update is our one-time cancellation lock.
-           *
-           * Only a PENDING order whose stock has not been restored
-           * may pass this update.
-           */
-          const cancellationUpdate = await transaction.order.updateMany({
-            where: {
-              id: existingOrder.id,
-
-              status: "PENDING",
-
-              stockRestoredAt: null,
-            },
-
-            data: {
-              status: "CANCELLED",
-
-              cancelledAt: statusChangedAt,
-
-              stockRestoredAt: statusChangedAt,
-            },
-          });
-
-          if (cancellationUpdate.count !== 1) {
-            throw new OrderRequestError(
-              409,
-              "ORDER_STATUS_CONFLICT",
-              "The order changed while cancellation was being processed.",
-            );
-          }
+          const statusChangedAt = new Date();
 
           /*
-           * Restore every reserved order item.
-           *
-           * This runs in the same transaction as the cancellation.
-           * If one restoration fails, the entire cancellation rolls back.
+           * Cancelling a PENDING order restores the stock that was
+           * reserved during order creation.
            */
-          for (const item of existingOrder.items) {
-            const stockRestoration = await transaction.product.updateMany({
+          if (requestedStatus === "CANCELLED") {
+            if (existingOrder.payment?.status === "SUCCESS") {
+              throw new OrderRequestError(
+                409,
+                "PAID_ORDER_CANNOT_BE_CANCELLED",
+                "A paid order cannot be cancelled without completing a refund workflow.",
+              );
+            }
+
+            /*
+             * Do not cancel while an M-Pesa request is unresolved.
+             *
+             * Safaricom could still complete the transaction and send
+             * its callback.
+             */
+            const unresolvedPaymentAttempt =
+              await transaction.paymentAttempt.findFirst({
+                where: {
+                  orderId: existingOrder.id,
+
+                  status: {
+                    in: ["PENDING", "VERIFYING"],
+                  },
+                },
+
+                select: {
+                  id: true,
+                  status: true,
+                },
+              });
+
+            if (unresolvedPaymentAttempt) {
+              throw new OrderRequestError(
+                409,
+                "PAYMENT_STILL_PROCESSING",
+                "This order has an unresolved payment request and cannot be cancelled yet.",
+              );
+            }
+
+            /*
+             * The conditional update is our one-time cancellation lock.
+             *
+             * Only a PENDING order whose stock has not been restored
+             * may pass this update.
+             */
+            const cancellationUpdate = await transaction.order.updateMany({
               where: {
-                id: item.productId,
+                id: existingOrder.id,
+
+                status: "PENDING",
+
+                stockRestoredAt: null,
               },
 
               data: {
-                stock: {
-                  increment: item.quantity,
-                },
+                status: "CANCELLED",
+
+                cancelledAt: statusChangedAt,
+
+                stockRestoredAt: statusChangedAt,
               },
             });
 
-            if (stockRestoration.count !== 1) {
-              throw new Error(
-                `Could not restore stock for product ${item.productId}.`,
+            if (cancellationUpdate.count !== 1) {
+              throw new OrderRequestError(
+                409,
+                "ORDER_STATUS_CONFLICT",
+                "The order changed while cancellation was being processed.",
               );
             }
+
+            /*
+             * Restore every reserved order item.
+             *
+             * This runs in the same transaction as the cancellation.
+             * If one restoration fails, the entire cancellation rolls back.
+             */
+            for (const item of existingOrder.items) {
+              const stockRestoration = await transaction.product.updateMany({
+                where: {
+                  id: item.productId,
+                },
+
+                data: {
+                  stock: {
+                    increment: item.quantity,
+                  },
+                },
+              });
+
+              if (stockRestoration.count !== 1) {
+                throw new Error(
+                  `Could not restore stock for product ${item.productId}.`,
+                );
+              }
+            }
+
+            const cancelledOrder = await transaction.order.findUnique({
+              where: {
+                id: existingOrder.id,
+              },
+
+              include: adminOrderResponseInclude,
+            });
+
+            return {
+              order: cancelledOrder,
+              unchanged: false,
+              stockRestored: true,
+            };
           }
 
-          const cancelledOrder = await transaction.order.findUnique({
+          /*
+           * PAID → PROCESSING requires a verified successful payment.
+           */
+          if (
+            requestedStatus === "PROCESSING" &&
+            existingOrder.payment?.status !== "SUCCESS"
+          ) {
+            throw new OrderRequestError(
+              409,
+              "PAYMENT_NOT_VERIFIED",
+              "The order cannot enter processing because its payment is not verified.",
+            );
+          }
+
+          const statusTimestampData = getStatusTimestampData(
+            requestedStatus,
+            statusChangedAt,
+          );
+
+          /*
+           * Update only when the database status still matches the
+           * status we originally validated.
+           */
+          const statusUpdate = await transaction.order.updateMany({
+            where: {
+              id: existingOrder.id,
+
+              status: existingOrder.status,
+            },
+
+            data: {
+              status: requestedStatus,
+
+              ...statusTimestampData,
+            },
+          });
+
+          if (statusUpdate.count !== 1) {
+            throw new OrderRequestError(
+              409,
+              "ORDER_STATUS_CONFLICT",
+              "The order status changed while this request was being processed.",
+            );
+          }
+
+          const updatedOrder = await transaction.order.findUnique({
             where: {
               id: existingOrder.id,
             },
@@ -1151,118 +1217,59 @@ router.patch("/admin/:id/status", protect, adminOnly, async (req, res) => {
           });
 
           return {
-            order: cancelledOrder,
+            order: updatedOrder,
             unchanged: false,
-            stockRestored: true,
+            stockRestored: false,
           };
-        }
+        },
+      );
 
-        /*
-         * PAID → PROCESSING requires a verified successful payment.
-         */
-        if (
-          requestedStatus === "PROCESSING" &&
-          existingOrder.payment?.status !== "SUCCESS"
-        ) {
-          throw new OrderRequestError(
-            409,
-            "PAYMENT_NOT_VERIFIED",
-            "The order cannot enter processing because its payment is not verified.",
-          );
-        }
+      return res.status(200).json({
+        success: true,
 
-        const statusTimestampData = getStatusTimestampData(
-          requestedStatus,
-          statusChangedAt,
-        );
+        unchanged: statusChangeResult.unchanged,
 
-        /*
-         * Update only when the database status still matches the
-         * status we originally validated.
-         */
-        const statusUpdate = await transaction.order.updateMany({
-          where: {
-            id: existingOrder.id,
+        stockRestored: statusChangeResult.stockRestored,
 
-            status: existingOrder.status,
-          },
+        message: statusChangeResult.unchanged
+          ? "The order already has this status."
+          : statusChangeResult.stockRestored
+            ? "Order cancelled and stock restored successfully."
+            : "Order status updated successfully.",
 
-          data: {
-            status: requestedStatus,
-
-            ...statusTimestampData,
-          },
+        order: statusChangeResult.order,
+      });
+    } catch (error) {
+      if (error instanceof OrderRequestError) {
+        return res.status(error.statusCode).json({
+          success: false,
+          code: error.code,
+          message: error.message,
         });
+      }
 
-        if (statusUpdate.count !== 1) {
-          throw new OrderRequestError(
-            409,
-            "ORDER_STATUS_CONFLICT",
-            "The order status changed while this request was being processed.",
-          );
-        }
+      if (error?.code === "P2034") {
+        return res.status(409).json({
+          success: false,
+          code: "ORDER_STATUS_CONCURRENCY_CONFLICT",
 
-        const updatedOrder = await transaction.order.findUnique({
-          where: {
-            id: existingOrder.id,
-          },
-
-          include: adminOrderResponseInclude,
+          message:
+            "The order was changed by another request. Refresh it and try again.",
         });
+      }
 
-        return {
-          order: updatedOrder,
-          unchanged: false,
-          stockRestored: false,
-        };
-      },
-    );
-
-    return res.status(200).json({
-      success: true,
-
-      unchanged: statusChangeResult.unchanged,
-
-      stockRestored: statusChangeResult.stockRestored,
-
-      message: statusChangeResult.unchanged
-        ? "The order already has this status."
-        : statusChangeResult.stockRestored
-          ? "Order cancelled and stock restored successfully."
-          : "Order status updated successfully.",
-
-      order: statusChangeResult.order,
-    });
-  } catch (error) {
-    if (error instanceof OrderRequestError) {
-      return res.status(error.statusCode).json({
-        success: false,
+      console.error("Update order status error:", {
+        name: error.name,
         code: error.code,
         message: error.message,
       });
-    }
 
-    if (error?.code === "P2034") {
-      return res.status(409).json({
+      return res.status(500).json({
         success: false,
-        code: "ORDER_STATUS_CONCURRENCY_CONFLICT",
-
-        message:
-          "The order was changed by another request. Refresh it and try again.",
+        message: "Failed to update the order status safely.",
       });
     }
-
-    console.error("Update order status error:", {
-      name: error.name,
-      code: error.code,
-      message: error.message,
-    });
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to update the order status safely.",
-    });
-  }
-});
+  },
+);
 
 export default router;

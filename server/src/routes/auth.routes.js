@@ -8,7 +8,13 @@ import { z } from "zod";
 import prisma from "../config/prisma.js";
 import { protect, adminOnly } from "../middleware/auth.middleware.js";
 import {
+  createCsrfToken,
+  requireCsrf,
+  requireTrustedOrigin,
+} from "../middleware/csrf.middleware.js";
+import {
   AUTH_COOKIE_NAME,
+  AUTH_MAX_ACTIVE_SESSIONS,
   AUTH_SESSION_SECONDS,
   JWT_ALGORITHM,
   JWT_AUDIENCE,
@@ -39,13 +45,9 @@ const loginSchema = z
       .string()
       .min(1, "Password is required.")
       .max(128, "Password is too long.")
-      .refine(
-        (password) => Buffer.byteLength(password, "utf8") <= 72,
-
-        {
-          message: "Password cannot exceed 72 bytes.",
-        },
-      ),
+      .refine((password) => Buffer.byteLength(password, "utf8") <= 72, {
+        message: "Password cannot exceed 72 bytes.",
+      }),
   })
   .strict();
 
@@ -59,13 +61,6 @@ const formatValidationErrors = (issues) =>
 |--------------------------------------------------------------------------
 | Login throttling
 |--------------------------------------------------------------------------
-|
-| We use two controls:
-|
-| 1. A broader IP limit.
-| 2. A smaller limit for one IP/email combination.
-|
-| Successful logins are removed from the failed-attempt count.
 */
 
 const loginIpLimiter = rateLimit({
@@ -78,7 +73,6 @@ const loginIpLimiter = rateLimit({
   handler: (req, res) => {
     return res.status(429).json({
       success: false,
-
       message: "Too many login attempts. Please wait before trying again.",
     });
   },
@@ -106,18 +100,14 @@ const loginAccountLimiter = rateLimit({
   handler: (req, res) => {
     return res.status(429).json({
       success: false,
-
       message: "Too many login attempts. Please wait before trying again.",
     });
   },
 });
 
 /*
- * A nonexistent account still performs a bcrypt comparison.
- *
- * This reduces the timing difference between:
- * - unknown email
- * - known email with wrong password
+ * Unknown accounts still perform a bcrypt comparison.
+ * This reduces account-enumeration timing differences.
  */
 const DUMMY_PASSWORD_HASH = bcrypt.hashSync("not-a-real-user-password", 10);
 
@@ -125,29 +115,107 @@ const DUMMY_PASSWORD_HASH = bcrypt.hashSync("not-a-real-user-password", 10);
 |--------------------------------------------------------------------------
 | JWT creation
 |--------------------------------------------------------------------------
+|
+| The JWT ID must be the same ID stored in AuthSession.
 */
 
-const createToken = (userId) => {
+const createToken = (userId, jwtId) => {
   return jwt.sign(
     {
       tokenType: "access",
     },
-
     JWT_SECRET,
-
     {
       algorithm: JWT_ALGORITHM,
-
       subject: userId,
-
       issuer: JWT_ISSUER,
       audience: JWT_AUDIENCE,
-
       expiresIn: AUTH_SESSION_SECONDS,
-
-      jwtid: randomUUID(),
+      jwtid: jwtId,
     },
   );
+};
+
+/*
+|--------------------------------------------------------------------------
+| Server-side session creation
+|--------------------------------------------------------------------------
+*/
+
+const createAuthSession = async (userId) => {
+  const currentTime = new Date();
+
+  const expiresAt = new Date(
+    currentTime.getTime() + AUTH_SESSION_SECONDS * 1000,
+  );
+
+  const jwtId = randomUUID();
+
+  const session = await prisma.$transaction(
+    async (transaction) => {
+      const activeSessions = await transaction.authSession.findMany({
+        where: {
+          userId,
+          revokedAt: null,
+
+          expiresAt: {
+            gt: currentTime,
+          },
+        },
+
+        orderBy: {
+          createdAt: "asc",
+        },
+
+        select: {
+          id: true,
+        },
+      });
+
+      /*
+       * Revoke the oldest session or sessions when the
+       * account has reached its active-session limit.
+       */
+      const sessionsToRevoke = Math.max(
+        0,
+        activeSessions.length - AUTH_MAX_ACTIVE_SESSIONS + 1,
+      );
+
+      if (sessionsToRevoke > 0) {
+        const sessionIds = activeSessions
+          .slice(0, sessionsToRevoke)
+          .map((activeSession) => activeSession.id);
+
+        await transaction.authSession.updateMany({
+          where: {
+            id: {
+              in: sessionIds,
+            },
+            revokedAt: null,
+          },
+
+          data: {
+            revokedAt: currentTime,
+
+            revocationReason: "SESSION_LIMIT_REACHED",
+          },
+        });
+      }
+
+      return transaction.authSession.create({
+        data: {
+          userId,
+          jwtId,
+          expiresAt,
+        },
+      });
+    },
+    {
+      isolationLevel: "Serializable",
+    },
+  );
+
+  return session;
 };
 
 /*
@@ -156,77 +224,132 @@ const createToken = (userId) => {
 |--------------------------------------------------------------------------
 */
 
-router.post("/login", loginIpLimiter, loginAccountLimiter, async (req, res) => {
-  try {
-    const validationResult = loginSchema.safeParse(req.body);
+router.post(
+  "/login",
+  requireTrustedOrigin,
+  loginIpLimiter,
+  loginAccountLimiter,
+  async (req, res) => {
+    try {
+      const validationResult = loginSchema.safeParse(req.body);
 
-    if (!validationResult.success) {
-      return res.status(400).json({
+      if (!validationResult.success) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid login information.",
+
+          errors: formatValidationErrors(validationResult.error.issues),
+        });
+      }
+
+      const { email, password } = validationResult.data;
+
+      const user = await prisma.user.findUnique({
+        where: {
+          email,
+        },
+      });
+
+      const passwordHash = user?.password || DUMMY_PASSWORD_HASH;
+
+      const passwordMatches = await bcrypt.compare(password, passwordHash);
+
+      if (!user || !passwordMatches) {
+        return res.status(401).json({
+          success: false,
+          message: "Invalid email or password.",
+        });
+      }
+
+      /*
+       * Create the database session first.
+       */
+      const session = await createAuthSession(user.id);
+
+      /*
+       * The token uses the same JWT ID stored in AuthSession.
+       */
+      const token = createToken(user.id, session.jwtId);
+
+      const csrfToken = createCsrfToken({
+        sessionId: session.id,
+
+        userId: user.id,
+
+        jwtId: session.jwtId,
+      });
+
+      res.cookie(AUTH_COOKIE_NAME, token, getAuthCookieOptions());
+
+      return res.status(200).json({
+        success: true,
+        message: "Login successful.",
+
+        session: {
+          expiresAt: session.expiresAt,
+
+          expiresInSeconds: AUTH_SESSION_SECONDS,
+
+          csrfToken,
+        },
+
+        user: {
+          id: user.id,
+          fullName: user.fullName,
+          email: user.email,
+          phone: user.phone,
+          role: user.role,
+        },
+      });
+    } catch (error) {
+      console.error("Secure login error:", {
+        name: error.name,
+        code: error.code,
+        message: error.message,
+      });
+
+      return res.status(500).json({
         success: false,
-
-        message: "Invalid login information.",
-
-        errors: formatValidationErrors(validationResult.error.issues),
+        message: "Login could not be completed safely.",
       });
     }
+  },
+);
 
-    const { email, password } = validationResult.data;
+/*
+|--------------------------------------------------------------------------
+| GET /api/auth/csrf-token
+|--------------------------------------------------------------------------
+|
+| Allows the frontend to retrieve its session-bound CSRF token
+| after refreshing the page.
+*/
 
-    const user = await prisma.user.findUnique({
-      where: {
-        email,
-      },
+router.get("/csrf-token", protect, (req, res) => {
+  try {
+    const csrfToken = createCsrfToken({
+      sessionId: req.auth.sessionId,
+
+      userId: req.user.id,
+
+      jwtId: req.auth.jwtId,
     });
 
-    /*
-     * Always perform a bcrypt comparison.
-     *
-     * Unknown accounts use the dummy hash so they do not
-     * return substantially faster than valid accounts.
-     */
-    const passwordHash = user?.password || DUMMY_PASSWORD_HASH;
-
-    const passwordMatches = await bcrypt.compare(password, passwordHash);
-
-    if (!user || !passwordMatches) {
-      return res.status(401).json({
-        success: false,
-
-        message: "Invalid email or password.",
-      });
-    }
-
-    const token = createToken(user.id);
-
-    res.cookie(AUTH_COOKIE_NAME, token, getAuthCookieOptions());
+    res.set("Cache-Control", "no-store");
 
     return res.status(200).json({
       success: true,
-      message: "Login successful.",
-
-      session: {
-        expiresInSeconds: AUTH_SESSION_SECONDS,
-      },
-
-      user: {
-        id: user.id,
-        fullName: user.fullName,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-      },
+      csrfToken,
     });
   } catch (error) {
-    console.error("Secure login error:", {
+    console.error("CSRF token generation error:", {
       name: error.name,
-      code: error.code,
       message: error.message,
     });
 
     return res.status(500).json({
       success: false,
-
-      message: "Login could not be completed safely.",
+      message: "The CSRF token could not be generated safely.",
     });
   }
 });
@@ -236,19 +359,58 @@ router.post("/login", loginIpLimiter, loginAccountLimiter, async (req, res) => {
 | POST /api/auth/logout
 |--------------------------------------------------------------------------
 |
-| This clears the browser cookie.
-|
-| Server-side token revocation will be added in the next authentication
-| security step.
+| Logout requires:
+| - A valid authenticated session
+| - A valid session-bound CSRF token
+| - Database session revocation
 */
 
-router.post("/logout", (req, res) => {
-  res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
+router.post("/logout", protect, requireCsrf, async (req, res) => {
+  try {
+    const revokedAt = new Date();
 
-  return res.status(200).json({
-    success: true,
-    message: "Logout successful.",
-  });
+    await prisma.authSession.updateMany({
+      where: {
+        id: req.auth.sessionId,
+
+        userId: req.user.id,
+
+        revokedAt: null,
+      },
+
+      data: {
+        revokedAt,
+
+        revocationReason: "USER_LOGOUT",
+      },
+    });
+
+    res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
+
+    return res.status(200).json({
+      success: true,
+      message: "Logout successful.",
+    });
+  } catch (error) {
+    /*
+     * Clear the browser cookie even if database revocation fails,
+     * but do not claim that server-side revocation succeeded.
+     */
+    res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
+
+    console.error("Session revocation error:", {
+      name: error.name,
+      code: error.code,
+      message: error.message,
+    });
+
+    return res.status(503).json({
+      success: false,
+
+      message:
+        "Your local session was cleared, but server-side logout could not be confirmed.",
+    });
+  }
 });
 
 /*
@@ -261,6 +423,10 @@ router.get("/me", protect, (req, res) => {
   return res.status(200).json({
     success: true,
     user: req.user,
+
+    session: {
+      expiresAt: req.auth.expiresAt,
+    },
   });
 });
 
@@ -273,9 +439,7 @@ router.get("/me", protect, (req, res) => {
 router.get("/admin-check", protect, adminOnly, (req, res) => {
   return res.status(200).json({
     success: true,
-
     message: "Admin access granted.",
-
     user: req.user,
   });
 });
