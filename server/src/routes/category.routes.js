@@ -2,29 +2,32 @@ import express from "express";
 import { z } from "zod";
 import prisma from "../config/prisma.js";
 import { protect, adminOnly } from "../middleware/auth.middleware.js";
-
+import { requireCsrf } from "../middleware/csrf.middleware.js";
 const router = express.Router();
 
-const createCategorySchema = z.object({
-  name: z
-    .string()
-    .trim()
-    .min(2, "Category name must contain at least 2 characters.")
-    .max(80, "Category name cannot exceed 80 characters."),
+const createCategorySchema = z
+  .object({
+    name: z
+      .string()
+      .trim()
+      .min(2, "Category name must contain at least 2 characters.")
+      .max(80, "Category name cannot exceed 80 characters."),
 
-  slug: z
-    .string()
-    .trim()
-    .min(2, "Slug must contain at least 2 characters.")
-    .max(100, "Slug cannot exceed 100 characters.")
-    .regex(
-      /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
-      "Slug must contain lowercase letters, numbers, and hyphens only.",
-    ),
-});
+    slug: z
+      .string()
+      .trim()
+      .min(2, "Slug must contain at least 2 characters.")
+      .max(100, "Slug cannot exceed 100 characters.")
+      .regex(
+        /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
+        "Slug must contain lowercase letters, numbers, and hyphens only.",
+      ),
+  })
+  .strict();
 
 const updateCategorySchema = createCategorySchema
   .partial()
+  .strict()
   .refine((data) => Object.keys(data).length > 0, {
     message: "Provide at least one field to update.",
   });
@@ -74,7 +77,7 @@ router.get("/", async (req, res) => {
  * POST /api/categories
  * Protected route: only admins can create categories.
  */
-router.post("/", protect, adminOnly, async (req, res) => {
+router.post("/", protect, adminOnly, requireCsrf, async (req, res) => {
   try {
     const result = createCategorySchema.safeParse(req.body);
 
@@ -114,6 +117,14 @@ router.post("/", protect, adminOnly, async (req, res) => {
       category,
     });
   } catch (error) {
+    if (error?.code === "P2002") {
+      return res.status(409).json({
+        success: false,
+        code: "CATEGORY_CONFLICT",
+
+        message: "A category with that name or slug already exists.",
+      });
+    }
     console.error("Create category error:", error);
 
     return res.status(500).json({
@@ -127,7 +138,7 @@ router.post("/", protect, adminOnly, async (req, res) => {
  * PATCH /api/categories/:id
  * Protected route: only admins can edit categories.
  */
-router.patch("/:id", protect, adminOnly, async (req, res) => {
+router.patch("/:id", protect, adminOnly, requireCsrf, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -191,6 +202,14 @@ router.patch("/:id", protect, adminOnly, async (req, res) => {
       category: updatedCategory,
     });
   } catch (error) {
+    if (error?.code === "P2002") {
+      return res.status(409).json({
+        success: false,
+        code: "CATEGORY_CONFLICT",
+
+        message: "A category with that name or slug already exists.",
+      });
+    }
     console.error("Update category error:", error);
 
     return res.status(500).json({
@@ -204,15 +223,37 @@ router.patch("/:id", protect, adminOnly, async (req, res) => {
  * DELETE /api/categories/:id
  * Protected route: only admins can delete categories.
  */
-router.delete("/:id", protect, adminOnly, async (req, res) => {
+router.delete("/:id", protect, adminOnly, requireCsrf, async (req, res) => {
   try {
     const { id } = req.params;
 
     const category = await prisma.category.findUnique({
-      where: { id },
+      where: {
+        id,
+      },
+
+      select: {
+        id: true,
+        name: true,
+
+        _count: {
+          select: {
+            products: true,
+          },
+        },
+      },
     });
 
     if (!category) {
+      if (category._count.products > 0) {
+        return res.status(409).json({
+          success: false,
+          code: "CATEGORY_NOT_EMPTY",
+
+          message:
+            "This category cannot be deleted while products are assigned to it.",
+        });
+      }
       return res.status(404).json({
         success: false,
         message: "Category not found.",

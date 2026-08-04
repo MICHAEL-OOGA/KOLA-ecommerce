@@ -2,8 +2,22 @@ import express from "express";
 import { z } from "zod";
 import prisma from "../config/prisma.js";
 import { protect, adminOnly } from "../middleware/auth.middleware.js";
-
+import { requireCsrf } from "../middleware/csrf.middleware.js";
 const router = express.Router();
+
+const isHttpOrHttpsUrl = (value) => {
+  try {
+    const parsedUrl = new URL(value);
+
+    return parsedUrl.protocol === "http:" || parsedUrl.protocol === "https:";
+  } catch {
+    return false;
+  }
+};
+
+const hasMaximumTwoDecimalPlaces = (value) => {
+  return /^\d+(?:\.\d{1,2})?$/.test(String(value));
+};
 
 /*
 |--------------------------------------------------------------------------
@@ -11,63 +25,75 @@ const router = express.Router();
 |--------------------------------------------------------------------------
 */
 
-const createProductSchema = z.object({
-  name: z
-    .string()
-    .trim()
-    .min(2, "Product name must contain at least 2 characters.")
-    .max(150, "Product name cannot exceed 150 characters."),
+const createProductSchema = z
+  .object({
+    name: z
+      .string()
+      .trim()
+      .min(2, "Product name must contain at least 2 characters.")
+      .max(150, "Product name cannot exceed 150 characters."),
 
-  slug: z
-    .string()
-    .trim()
-    .min(2, "Slug must contain at least 2 characters.")
-    .max(180, "Slug cannot exceed 180 characters.")
-    .regex(
-      /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
-      "Slug must contain lowercase letters, numbers, and hyphens only.",
-    ),
+    slug: z
+      .string()
+      .trim()
+      .min(2, "Slug must contain at least 2 characters.")
+      .max(180, "Slug cannot exceed 180 characters.")
+      .regex(
+        /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
+        "Slug must contain lowercase letters, numbers, and hyphens only.",
+      ),
 
-  description: z
-    .string()
-    .trim()
-    .max(5000, "Description cannot exceed 5000 characters.")
-    .optional()
-    .nullable(),
+    description: z
+      .string()
+      .trim()
+      .max(5000, "Description cannot exceed 5000 characters.")
+      .optional()
+      .nullable(),
 
-  price: z
-    .number()
-    .positive("Price must be greater than zero.")
-    .max(99999999.99, "Price is too large."),
+    price: z
+      .number()
+      .finite("Price must be a finite number.")
+      .positive("Price must be greater than zero.")
+      .max(99999999.99, "Price is too large.")
+      .refine(hasMaximumTwoDecimalPlaces, {
+        message: "Price cannot contain more than two decimal places.",
+      }),
 
-  stock: z
-    .number()
-    .int("Stock must be a whole number.")
-    .min(0, "Stock cannot be negative."),
+    stock: z
+      .number()
+      .int("Stock must be a whole number.")
+      .min(0, "Stock cannot be negative.")
+      .max(1_000_000, "Stock value is too large."),
 
-  imageUrl: z
-    .string()
-    .trim()
-    .url("Image URL must be a valid URL.")
-    .optional()
-    .nullable(),
+    imageUrl: z
+      .string()
+      .trim()
+      .max(2048, "Image URL is too long.")
+      .url("Image URL must be a valid URL.")
+      .refine(isHttpOrHttpsUrl, {
+        message: "Image URL must use HTTP or HTTPS.",
+      })
+      .optional()
+      .nullable(),
 
-  categoryId: z.string().trim().min(1).optional().nullable(),
+    categoryId: z
+      .string()
+      .trim()
+      .min(1, "Category ID cannot be empty.")
+      .max(100, "Category ID is invalid.")
+      .optional()
+      .nullable(),
 
-  isActive: z.boolean().optional(),
-});
+    isActive: z.boolean().optional(),
+  })
+  .strict();
 
 const updateProductSchema = createProductSchema
   .partial()
+  .strict()
   .refine((data) => Object.keys(data).length > 0, {
     message: "Provide at least one field to update.",
   });
-
-const formatValidationErrors = (issues) =>
-  issues.map((issue) => ({
-    field: issue.path.join("."),
-    message: issue.message,
-  }));
 
 /*
 |--------------------------------------------------------------------------
@@ -216,7 +242,7 @@ router.get("/:id", async (req, res) => {
 | Creates a new product.
 */
 
-router.post("/", protect, adminOnly, async (req, res) => {
+router.post("/", protect, adminOnly, requireCsrf, async (req, res) => {
   try {
     const result = createProductSchema.safeParse(req.body);
 
@@ -302,6 +328,13 @@ router.post("/", protect, adminOnly, async (req, res) => {
       product,
     });
   } catch (error) {
+    if (error?.code === "P2002") {
+      return res.status(409).json({
+        success: false,
+        code: "PRODUCT_ALREADY_EXISTS",
+        message: "A product with that slug already exists.",
+      });
+    }
     console.error("Create product error:", error);
 
     return res.status(500).json({
@@ -319,7 +352,7 @@ router.post("/", protect, adminOnly, async (req, res) => {
 | Updates one or more product fields.
 */
 
-router.patch("/:id", protect, adminOnly, async (req, res) => {
+router.patch("/:id", protect, adminOnly, requireCsrf, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -410,6 +443,13 @@ router.patch("/:id", protect, adminOnly, async (req, res) => {
       product: updatedProduct,
     });
   } catch (error) {
+    if (error?.code === "P2002") {
+      return res.status(409).json({
+        success: false,
+        code: "PRODUCT_SLUG_CONFLICT",
+        message: "Another product already uses that slug.",
+      });
+    }
     console.error("Update product error:", error);
 
     return res.status(500).json({
@@ -431,7 +471,7 @@ router.patch("/:id", protect, adminOnly, async (req, res) => {
 | history.
 */
 
-router.delete("/:id", protect, adminOnly, async (req, res) => {
+router.delete("/:id", protect, adminOnly, requireCsrf, async (req, res) => {
   try {
     const { id } = req.params;
 

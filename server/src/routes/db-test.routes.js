@@ -1,23 +1,40 @@
 import express from "express";
+
 import prisma from "../config/prisma.js";
+import { protect, adminOnly } from "../middleware/auth.middleware.js";
 
 const router = express.Router();
 
-router.get("/", async (req, res) => {
-  try {
-    const userCount = await prisma.user.count();
+/*
+|--------------------------------------------------------------------------
+| Development-only database test
+|--------------------------------------------------------------------------
+|
+| app.js must not mount this route in production.
+*/
 
-    res.status(200).json({
+router.get("/", protect, adminOnly, async (req, res) => {
+  try {
+    /*
+     * Perform a harmless database query.
+     * Do not expose record counts or database details.
+     */
+    await prisma.user.count();
+
+    return res.status(200).json({
       success: true,
       message: "Database connection is working.",
-      userCount,
     });
   } catch (error) {
-    console.error("Database test error:", error);
+    console.error("Database test error:", {
+      name: error.name,
+      code: error.code,
+      message: error.message,
+    });
 
-    res.status(500).json({
+    return res.status(503).json({
       success: false,
-      message: "Database connection failed.",
+      message: "Database connection is unavailable.",
     });
   }
 });
