@@ -13,6 +13,7 @@ import categoryRoutes from "./routes/category.routes.js";
 import productRoutes from "./routes/product.routes.js";
 import orderRoutes from "./routes/order.routes.js";
 import mpesaRoutes from "./routes/mpesa.routes.js";
+import passwordResetRoutes from "./routes/password-reset.routes.js";
 
 import {
   API_RATE_LIMIT_MAX,
@@ -280,6 +281,7 @@ app.use(
     return next();
   },
   authRoutes,
+  passwordResetRoutes,
 );
 
 app.use("/api/categories", categoryRoutes);
