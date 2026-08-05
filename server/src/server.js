@@ -1,4 +1,5 @@
 import "dotenv/config";
+
 import app from "./app.js";
 import prisma from "./config/prisma.js";
 import {
@@ -16,7 +17,39 @@ const server = app.listen(PORT, () => {
   startOrderExpiryWorker();
 });
 
-const shutdown = (signal) => {
+/*
+|--------------------------------------------------------------------------
+| HTTP-server limits
+|--------------------------------------------------------------------------
+*/
+
+server.requestTimeout = 30_000;
+server.headersTimeout = 15_000;
+server.keepAliveTimeout = 5_000;
+
+server.maxHeadersCount = 100;
+server.maxRequestsPerSocket = 1_000;
+
+/*
+ * Reject malformed HTTP requests without passing them into Express.
+ */
+server.on("clientError", (error, socket) => {
+  console.error("Malformed HTTP request rejected:", {
+    code: error.code,
+    message: error.message,
+  });
+
+  if (socket.writable) {
+    socket.end(
+      "HTTP/1.1 400 Bad Request\r\n" +
+        "Connection: close\r\n" +
+        "Content-Length: 0\r\n" +
+        "\r\n",
+    );
+  }
+});
+
+const shutdown = (signal, exitCode = 0) => {
   if (shutdownStarted) {
     return;
   }
@@ -30,8 +63,10 @@ const shutdown = (signal) => {
   const forcedShutdownTimer = setTimeout(() => {
     console.error("Forced shutdown after waiting for active requests.");
 
+    server.closeAllConnections?.();
+
     process.exit(1);
-  }, 10_000);
+  }, 30_000);
 
   forcedShutdownTimer.unref();
 
@@ -47,15 +82,22 @@ const shutdown = (signal) => {
     }
 
     if (error) {
-      console.error("HTTP server shutdown error:", error);
+      console.error("HTTP server shutdown error:", {
+        message: error.message,
+      });
 
       process.exit(1);
     }
 
     console.log("Server stopped safely.");
 
-    process.exit(0);
+    process.exit(exitCode);
   });
+
+  /*
+   * Close idle keep-alive sockets immediately while active requests finish.
+   */
+  server.closeIdleConnections?.();
 };
 
 process.on("SIGINT", () => {
@@ -64,4 +106,21 @@ process.on("SIGINT", () => {
 
 process.on("SIGTERM", () => {
   shutdown("SIGTERM");
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", {
+    message: reason instanceof Error ? reason.message : String(reason),
+  });
+
+  shutdown("UNHANDLED_REJECTION", 1);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception:", {
+    name: error.name,
+    message: error.message,
+  });
+
+  shutdown("UNCAUGHT_EXCEPTION", 1);
 });

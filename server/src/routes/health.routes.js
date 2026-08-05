@@ -3,9 +3,15 @@ import express from "express";
 const router = express.Router();
 
 router.get("/", (req, res) => {
-  res.status(200).json({
+  res.set("Cache-Control", "no-store");
+
+  return res.status(200).json({
     success: true,
-    message: "Backend is running properly",
+    status: "ok",
+
+    uptimeSeconds: Math.floor(process.uptime()),
+
+    requestId: req.id,
   });
 });
 

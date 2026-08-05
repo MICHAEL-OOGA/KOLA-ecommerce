@@ -6,6 +6,7 @@
 
 const MPESA_REQUEST_TIMEOUT_MS = 15_000;
 const TOKEN_EXPIRY_SAFETY_MARGIN_MS = 60_000;
+const MPESA_MAX_RESPONSE_BYTES = 64 * 1024;
 
 const allowedMpesaEnvironments = new Set(["sandbox", "production"]);
 
@@ -66,7 +67,20 @@ const getProviderErrorMessage = (data, fallbackMessage) => {
 };
 
 const parseJsonResponse = async (response) => {
+  const contentLength = Number(response.headers.get("content-length"));
+
+  if (
+    Number.isFinite(contentLength) &&
+    contentLength > MPESA_MAX_RESPONSE_BYTES
+  ) {
+    throw new Error("M-Pesa returned an unexpectedly large response.");
+  }
+
   const responseText = await response.text();
+
+  if (Buffer.byteLength(responseText, "utf8") > MPESA_MAX_RESPONSE_BYTES) {
+    throw new Error("M-Pesa returned an unexpectedly large response.");
+  }
 
   if (!responseText) {
     return {};
@@ -99,7 +113,10 @@ const fetchMpesaJson = async (
   try {
     const response = await fetch(url, {
       ...options,
+
       signal: controller.signal,
+
+      redirect: "error",
     });
 
     const data = await parseJsonResponse(response);

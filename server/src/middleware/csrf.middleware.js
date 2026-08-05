@@ -2,63 +2,58 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 import { CSRF_SECRET } from "../config/auth.config.js";
 
+import { isTrustedClientOrigin } from "../config/http.config.js";
+
+/*
+|--------------------------------------------------------------------------
+| Safe HTTP methods
+|--------------------------------------------------------------------------
+|
+| GET, HEAD and OPTIONS should not change server-side data, so they do not
+| require a CSRF token.
+*/
+
 const SAFE_HTTP_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 const CSRF_TOKEN_PATTERN = /^[a-f0-9]{64}$/;
 
-const normalizeOrigin = (value) => {
-  try {
-    return new URL(value).origin;
-  } catch {
-    return null;
-  }
-};
-
-const getTrustedClientOrigin = () => {
-  const configuredOrigin =
-    process.env.CLIENT_URL?.trim() || "http://localhost:5173";
-
-  const normalizedOrigin = normalizeOrigin(configuredOrigin);
-
-  if (!normalizedOrigin) {
-    throw new Error("CLIENT_URL must contain a valid origin.");
-  }
-
-  return normalizedOrigin;
-};
-
-const TRUSTED_CLIENT_ORIGIN = getTrustedClientOrigin();
-
 /*
 |--------------------------------------------------------------------------
-| Origin validation
+| Request-origin validation
 |--------------------------------------------------------------------------
 |
-| Browsers normally supply Origin or Referer for unsafe requests.
-| Postman and other non-browser tools may supply neither, so missing
-| headers are permitted. Present headers must match CLIENT_URL exactly.
+| Browser requests normally include either:
+| - Origin
+| - Referer
+|
+| When either header is present, it must match one of the trusted frontend header is present, it must match one of the trusted frontend
+| origins configured in CLIENT_URLS.
+|
+| Non-browser clients such as Postman may omit both headers.
 */
 
 const requestOriginIsTrusted = (req) => {
   const originHeader = req.get("Origin");
 
   if (originHeader) {
-    const requestOrigin = normalizeOrigin(originHeader);
-
-    return requestOrigin !== null && requestOrigin === TRUSTED_CLIENT_ORIGIN;
+    return isTrustedClientOrigin(originHeader);
   }
 
   const refererHeader = req.get("Referer");
 
   if (refererHeader) {
-    const requestOrigin = normalizeOrigin(refererHeader);
+    try {
+      const refererOrigin = new URL(refererHeader).origin;
 
-    return requestOrigin !== null && requestOrigin === TRUSTED_CLIENT_ORIGIN;
+      return isTrustedClientOrigin(refererOrigin);
+    } catch {
+      return false;
+    }
   }
 
   /*
-   * Non-browser clients such as Postman may not send either header.
-   * Their authentication and CSRF token are still required.
+   * Postman, Safaricom and other non-browser clients may not send
+   * Origin or Referer.
    */
   return true;
 };
@@ -67,9 +62,20 @@ const rejectUntrustedOrigin = (res) => {
   return res.status(403).json({
     success: false,
     code: "UNTRUSTED_REQUEST_ORIGIN",
+
     message: "The request origin is not permitted.",
   });
 };
+
+/*
+|--------------------------------------------------------------------------
+| Trusted-origin middleware
+|--------------------------------------------------------------------------
+|
+| Use this on routes such as:
+| - POST /api/auth/login
+| - POST /api/mpesa/stk-push
+*/
 
 export const requireTrustedOrigin = (req, res, next) => {
   if (!requestOriginIsTrusted(req)) {
@@ -81,15 +87,15 @@ export const requireTrustedOrigin = (req, res, next) => {
 
 /*
 |--------------------------------------------------------------------------
-| Session-bound CSRF token
+| Session-bound CSRF-token creation
 |--------------------------------------------------------------------------
 |
-| The token is an HMAC of:
-| - AuthSession ID
-| - User ID
-| - JWT ID
+| The CSRF token is tied to:
+| - The database AuthSession ID
+| - The authenticated user ID
+| - The JWT ID
 |
-| It is therefore valid only for one authenticated session.
+| A token from one login session cannot be used by another login session.
 */
 
 const buildCsrfTokenMessage = ({ sessionId, userId, jwtId }) => {
@@ -101,7 +107,14 @@ const buildCsrfTokenMessage = ({ sessionId, userId, jwtId }) => {
 };
 
 export const createCsrfToken = ({ sessionId, userId, jwtId }) => {
-  if (!sessionId || !userId || !jwtId) {
+  if (
+    typeof sessionId !== "string" ||
+    !sessionId ||
+    typeof userId !== "string" ||
+    !userId ||
+    typeof jwtId !== "string" ||
+    !jwtId
+  ) {
     throw new Error(
       "Complete session information is required to generate a CSRF token.",
     );
@@ -116,8 +129,16 @@ export const createCsrfToken = ({ sessionId, userId, jwtId }) => {
   return createHmac("sha256", CSRF_SECRET).update(message).digest("hex");
 };
 
+/*
+|--------------------------------------------------------------------------
+| Constant-time CSRF-token comparison
+|--------------------------------------------------------------------------
+*/
+
 const csrfTokensMatch = (receivedToken, expectedToken) => {
   if (
+    typeof receivedToken !== "string" ||
+    typeof expectedToken !== "string" ||
     !CSRF_TOKEN_PATTERN.test(receivedToken) ||
     !CSRF_TOKEN_PATTERN.test(expectedToken)
   ) {
@@ -140,11 +161,18 @@ const csrfTokensMatch = (receivedToken, expectedToken) => {
 | CSRF enforcement middleware
 |--------------------------------------------------------------------------
 |
-| protect must run before this middleware so req.user and req.auth exist.
+| Middleware order must be:
+|
+| protect
+| adminOnly, where required
+| requireCsrf
+| route handler
 */
 
 export const requireCsrf = (req, res, next) => {
-  if (SAFE_HTTP_METHODS.has(req.method.toUpperCase())) {
+  const requestMethod = req.method.toUpperCase();
+
+  if (SAFE_HTTP_METHODS.has(requestMethod)) {
     return next();
   }
 
@@ -155,6 +183,7 @@ export const requireCsrf = (req, res, next) => {
   if (!req.user?.id || !req.auth?.sessionId || !req.auth?.jwtId) {
     return res.status(401).json({
       success: false,
+
       message: "Authentication is required.",
     });
   }
@@ -165,6 +194,7 @@ export const requireCsrf = (req, res, next) => {
     return res.status(403).json({
       success: false,
       code: "CSRF_TOKEN_REQUIRED",
+
       message: "A valid CSRF token is required.",
     });
   }
@@ -181,6 +211,7 @@ export const requireCsrf = (req, res, next) => {
     return res.status(403).json({
       success: false,
       code: "INVALID_CSRF_TOKEN",
+
       message: "The CSRF token is invalid.",
     });
   }

@@ -1,6 +1,7 @@
 import express from "express";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { protect, adminOnly } from "../middleware/auth.middleware.js";
+import { requireTrustedOrigin } from "../middleware/csrf.middleware.js";
 import {
   getMpesaAccessToken,
   initiateMpesaStkPush,
@@ -12,9 +13,27 @@ import prisma from "../config/prisma.js";
 
 const router = express.Router();
 
-const stkPushSchema = z.object({
-  orderId: z.string().trim().min(1, "Order ID is required."),
-});
+/*
+|--------------------------------------------------------------------------
+| STK Push validation
+|--------------------------------------------------------------------------
+*/
+
+const stkPushSchema = z
+  .object({
+    orderId: z
+      .string()
+      .trim()
+      .min(1, "Order ID is required.")
+      .max(100, "Order ID is invalid."),
+  })
+  .strict();
+
+/*
+|--------------------------------------------------------------------------
+| STK Push rate limit
+|--------------------------------------------------------------------------
+*/
 
 const stkPushLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
@@ -25,6 +44,50 @@ const stkPushLimiter = rateLimit({
   message: {
     success: false,
     message: "Too many payment attempts. Please wait before trying again.",
+  },
+});
+
+/*
+|--------------------------------------------------------------------------
+| Callback rate limit
+|--------------------------------------------------------------------------
+*/
+
+const readCallbackRateLimit = () => {
+  const rawValue = process.env.MPESA_CALLBACK_RATE_LIMIT_MAX?.trim();
+
+  if (!rawValue) {
+    return 300;
+  }
+
+  const parsedValue = Number(rawValue);
+
+  if (
+    !Number.isSafeInteger(parsedValue) ||
+    parsedValue < 10 ||
+    parsedValue > 10_000
+  ) {
+    throw new Error(
+      "MPESA_CALLBACK_RATE_LIMIT_MAX must be between 10 and 10000.",
+    );
+  }
+
+  return parsedValue;
+};
+
+const mpesaCallbackLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: readCallbackRateLimit(),
+
+  standardHeaders: false,
+  legacyHeaders: false,
+
+  handler: (req, res) => {
+    return res.status(429).json({
+      ResultCode: 1,
+
+      ResultDesc: "Too many callback requests.",
+    });
   },
 });
 
@@ -78,23 +141,21 @@ const reservePaymentAttempt = async (orderId) => {
       if (order.status !== "PENDING") {
         throw new HttpError(
           409,
+
           `Payment cannot be initiated for an order with status ${order.status}.`,
         );
       }
 
       /*
-       * A successful summary payment means this order must never be charged
-       * again, even if its order status was changed incorrectly.
+       * A successful summary payment means this order must never
+       * be charged again.
        */
       if (order.payment?.status === "SUCCESS") {
         throw new HttpError(409, "This order has already been paid.");
       }
 
       /*
-       * Check for an unfinished attempt.
-       *
-       * Any PENDING or VERIFYING attempt blocks another request. An old
-       * unresolved attempt must be investigated rather than silently ignored.
+       * Any PENDING or VERIFYING attempt blocks another request.
        */
       const activeAttempt = await transaction.paymentAttempt.findFirst({
         where: {
@@ -115,6 +176,7 @@ const reservePaymentAttempt = async (orderId) => {
 
         throw new HttpError(
           409,
+
           attemptIsRecent
             ? "A recent payment request is still being processed for this order."
             : "A previous payment request still requires verification. Do not retry yet.",
@@ -122,13 +184,14 @@ const reservePaymentAttempt = async (orderId) => {
       }
 
       /*
-       * The amount comes from our database, never from the browser.
+       * The amount comes from PostgreSQL, never from the browser.
        */
       const amount = Number(order.totalAmount);
 
       if (!Number.isSafeInteger(amount) || amount < 1) {
         throw new HttpError(
           400,
+
           "The order amount must be a positive whole number for M-Pesa.",
         );
       }
@@ -137,9 +200,6 @@ const reservePaymentAttempt = async (orderId) => {
 
       /*
        * Create the attempt before contacting Safaricom.
-       *
-       * This gives us a permanent record even when the external request
-       * fails, times out, or the application restarts.
        */
       const paymentAttempt = await transaction.paymentAttempt.create({
         data: {
@@ -147,15 +207,17 @@ const reservePaymentAttempt = async (orderId) => {
           method: "MPESA",
           status: "PENDING",
           amount: order.totalAmount,
+
           phoneNumber: order.customerPhone,
+
           accountReference,
+
           initiationResponseDescription: "Payment attempt reserved.",
         },
       });
 
       /*
-       * Payment remains the order's current payment summary.
-       *
+       * Payment contains the order's current payment summary.
        * PaymentAttempt contains the complete attempt history.
        */
       await transaction.payment.upsert({
@@ -167,12 +229,16 @@ const reservePaymentAttempt = async (orderId) => {
           method: "MPESA",
           status: "PENDING",
           amount: order.totalAmount,
+
           phoneNumber: order.customerPhone,
+
           merchantRequestId: null,
           checkoutRequestId: null,
           mpesaReceiptNumber: null,
           resultCode: null,
+
           resultDescription: "A new payment attempt has been reserved.",
+
           verifiedAt: null,
           paidAt: null,
         },
@@ -182,7 +248,9 @@ const reservePaymentAttempt = async (orderId) => {
           method: "MPESA",
           status: "PENDING",
           amount: order.totalAmount,
+
           phoneNumber: order.customerPhone,
+
           resultDescription: "A payment attempt has been reserved.",
         },
       });
@@ -195,10 +263,6 @@ const reservePaymentAttempt = async (orderId) => {
       };
     },
 
-    /*
-     * Serializable isolation helps protect the check-and-create sequence
-     * from concurrent payment requests.
-     */
     {
       isolationLevel: "Serializable",
     },
@@ -207,42 +271,60 @@ const reservePaymentAttempt = async (orderId) => {
 
 /*
 |--------------------------------------------------------------------------
-| Callback validation and security helpers
+| Callback validation
 |--------------------------------------------------------------------------
 */
 
-const callbackMetadataItemSchema = z.object({
-  Name: z.string().trim().min(1).max(100),
-  Value: z.unknown().optional(),
-});
+const callbackMetadataItemSchema = z
+  .object({
+    Name: z.string().trim().min(1).max(100),
 
-const mpesaCallbackSchema = z.object({
-  Body: z.object({
-    stkCallback: z.object({
-      MerchantRequestID: z.string().trim().min(1).max(200),
+    Value: z.unknown().optional(),
+  })
+  .strict();
 
-      CheckoutRequestID: z.string().trim().min(1).max(200),
+const mpesaCallbackSchema = z
+  .object({
+    Body: z
+      .object({
+        stkCallback: z
+          .object({
+            MerchantRequestID: z.string().trim().min(1).max(200),
 
-      ResultCode: z.union([
-        z.number().int(),
-        z
-          .string()
-          .trim()
-          .regex(/^-?\d+$/),
-      ]),
+            CheckoutRequestID: z.string().trim().min(1).max(200),
 
-      ResultDesc: z.string().trim().max(500).optional().default(""),
+            ResultCode: z.union([
+              z.number().int(),
 
-      CallbackMetadata: z
-        .object({
-          Item: z.array(callbackMetadataItemSchema).max(20),
-        })
-        .optional(),
-    }),
-  }),
-});
+              z
+                .string()
+                .trim()
+                .regex(/^-?\d+$/),
+            ]),
+
+            ResultDesc: z.string().trim().max(500).optional().default(""),
+
+            CallbackMetadata: z
+              .object({
+                Item: z.array(callbackMetadataItemSchema).max(20),
+              })
+              .strict()
+              .optional(),
+          })
+          .strict(),
+      })
+      .strict(),
+  })
+  .strict();
+
+/*
+|--------------------------------------------------------------------------
+| Callback helpers
+|--------------------------------------------------------------------------
+*/
 
 const CALLBACK_ATTEMPT_LOOKUP_ATTEMPTS = 8;
+
 const CALLBACK_ATTEMPT_LOOKUP_DELAY_MS = 500;
 
 const wait = (milliseconds) =>
@@ -262,9 +344,11 @@ const getRequiredCallbackToken = () => {
 
 const callbackTokenMatches = (providedToken) => {
   const expectedToken = getRequiredCallbackToken();
+
   const normalizedProvidedToken = String(providedToken || "");
 
   const expectedBuffer = Buffer.from(expectedToken);
+
   const providedBuffer = Buffer.from(normalizedProvidedToken);
 
   if (expectedBuffer.length !== providedBuffer.length) {
@@ -296,10 +380,15 @@ const parseMpesaTransactionDate = (value) => {
   }
 
   const year = timestamp.slice(0, 4);
+
   const month = timestamp.slice(4, 6);
+
   const day = timestamp.slice(6, 8);
+
   const hour = timestamp.slice(8, 10);
+
   const minute = timestamp.slice(10, 12);
+
   const second = timestamp.slice(12, 14);
 
   const parsedDate = new Date(
@@ -333,9 +422,13 @@ const buildCallbackEventKey = ({
     checkoutRequestId,
     resultCode,
     resultDescription,
+
     amount: metadata.Amount ?? null,
+
     mpesaReceiptNumber: metadata.MpesaReceiptNumber ?? null,
+
     transactionDate: metadata.TransactionDate ?? null,
+
     phoneNumber: normalizeMpesaPhone(metadata.PhoneNumber),
   });
 
@@ -411,6 +504,7 @@ const createOrResumeCallbackEvent = async ({
     ) {
       return {
         callbackEvent: existingEvent,
+
         alreadyHandled: true,
       };
     }
@@ -422,6 +516,7 @@ const createOrResumeCallbackEvent = async ({
 
       data: {
         processingStatus: "RECEIVED",
+
         errorMessage: null,
         processedAt: null,
       },
@@ -429,6 +524,7 @@ const createOrResumeCallbackEvent = async ({
 
     return {
       callbackEvent: resumedEvent,
+
       alreadyHandled: false,
     };
   }
@@ -448,7 +544,9 @@ const markAttemptForManualVerification = async ({
 
       data: {
         status: "VERIFYING",
+
         callbackReceivedAt: new Date(),
+
         resultDescription: message,
       },
     }),
@@ -456,6 +554,7 @@ const markAttemptForManualVerification = async ({
     prisma.payment.updateMany({
       where: {
         orderId: paymentAttempt.orderId,
+
         checkoutRequestId: paymentAttempt.checkoutRequestId,
 
         status: {
@@ -465,6 +564,7 @@ const markAttemptForManualVerification = async ({
 
       data: {
         status: "VERIFYING",
+
         resultDescription: message,
       },
     }),
@@ -476,8 +576,11 @@ const markAttemptForManualVerification = async ({
 
       data: {
         paymentAttemptId: paymentAttempt.id,
+
         processingStatus,
+
         errorMessage: message,
+
         processedAt: new Date(),
       },
     }),
@@ -512,290 +615,305 @@ const runSerializableTransactionWithRetry = async (
 |--------------------------------------------------------------------------
 | GET /api/mpesa/token-test
 |--------------------------------------------------------------------------
-| Admin-only diagnostic route.
-*/
-
-router.get("/token-test", protect, adminOnly, async (req, res) => {
-  try {
-    const { accessToken, expiresIn } = await getMpesaAccessToken();
-
-    return res.status(200).json({
-      success: true,
-      message: "M-Pesa authentication successful.",
-      tokenReceived: Boolean(accessToken),
-      expiresIn,
-    });
-  } catch (error) {
-    console.error("M-Pesa token test error:", {
-      name: error.name,
-      message: error.message,
-    });
-
-    return res.status(500).json({
-      success: false,
-      message: error.message || "M-Pesa authentication failed.",
-    });
-  }
-});
-
-/*
-|--------------------------------------------------------------------------
-| POST /api/mpesa/stk-push
-|--------------------------------------------------------------------------
-| Initiates M-Pesa payment for an existing pending order.
 |
-| The frontend only submits the order ID.
-| The backend reads the real phone number and amount from the database.
+| Development-only admin diagnostic route.
 */
 
-router.post("/stk-push", stkPushLimiter, async (req, res) => {
-  try {
-    const result = stkPushSchema.safeParse(req.body);
-
-    if (!result.success) {
-      return res.status(400).json({
-        success: false,
-        message: "A valid order ID is required.",
-
-        errors: result.error.issues.map((issue) => ({
-          field: issue.path.join("."),
-          message: issue.message,
-        })),
-      });
-    }
-
-    const { orderId } = result.data;
-
-    /*
-     * Reserve the attempt in PostgreSQL before contacting Safaricom.
-     */
-    const { order, paymentAttempt, amount, accountReference } =
-      await reservePaymentAttempt(orderId);
-
-    let stkResponse;
-
-    /*
-     * Contact Safaricom only after the database reservation succeeds.
-     */
+if (process.env.NODE_ENV !== "production") {
+  router.get("/token-test", protect, adminOnly, async (req, res) => {
     try {
-      stkResponse = await initiateMpesaStkPush({
-        phoneNumber: order.customerPhone,
-        amount,
-        accountReference,
+      const { accessToken, expiresIn } = await getMpesaAccessToken();
+
+      return res.status(200).json({
+        success: true,
+
+        message: "M-Pesa authentication successful.",
+
+        tokenReceived: Boolean(accessToken),
+
+        expiresIn,
       });
-    } catch (providerError) {
-      const providerErrorMessage = String(
-        providerError.message || "M-Pesa initiation failed.",
-      ).slice(0, 500);
+    } catch (error) {
+      console.error("M-Pesa token test error:", {
+        name: error.name,
 
-      /*
-       * A timeout or network interruption creates uncertainty:
-       * Safaricom might have received the request even though our backend
-       * did not receive the response.
-       *
-       * Therefore, mark it VERIFYING rather than assuming it failed.
-       */
-      const resultIsUncertain =
-        /timed out|network|fetch failed|socket|ECONNRESET/i.test(
-          providerErrorMessage,
-        );
-
-      const attemptStatus = resultIsUncertain ? "VERIFYING" : "FAILED";
-
-      await prisma.$transaction([
-        prisma.paymentAttempt.update({
-          where: {
-            id: paymentAttempt.id,
-          },
-
-          data: {
-            status: attemptStatus,
-            initiationResponseDescription: providerErrorMessage,
-          },
-        }),
-
-        prisma.payment.updateMany({
-          where: {
-            orderId: order.id,
-            status: "PENDING",
-            checkoutRequestId: null,
-          },
-
-          data: {
-            status: attemptStatus,
-            resultDescription: providerErrorMessage,
-          },
-        }),
-      ]);
-
-      console.error("M-Pesa initiation failed:", {
-        orderId: order.id,
-        paymentAttemptId: paymentAttempt.id,
-        uncertain: resultIsUncertain,
-      });
-
-      return res.status(resultIsUncertain ? 504 : 502).json({
-        success: false,
-
-        message: resultIsUncertain
-          ? "The payment provider did not respond in time. Do not retry immediately."
-          : "M-Pesa could not initiate the payment request.",
-      });
-    }
-
-    /*
-     * Safaricom accepted the request.
-     *
-     * Store its identifiers in both:
-     * - PaymentAttempt: permanent historical record
-     * - Payment: current summary for the order
-     */
-    try {
-      await prisma.$transaction([
-        prisma.paymentAttempt.update({
-          where: {
-            id: paymentAttempt.id,
-          },
-
-          data: {
-            status: "PENDING",
-
-            merchantRequestId: stkResponse.MerchantRequestID,
-
-            checkoutRequestId: stkResponse.CheckoutRequestID,
-
-            initiationResponseCode: String(stkResponse.ResponseCode),
-
-            initiationResponseDescription:
-              stkResponse.ResponseDescription ||
-              stkResponse.CustomerMessage ||
-              "STK Push initiated successfully.",
-          },
-        }),
-
-        prisma.payment.update({
-          where: {
-            orderId: order.id,
-          },
-
-          data: {
-            status: "PENDING",
-
-            merchantRequestId: stkResponse.MerchantRequestID,
-
-            checkoutRequestId: stkResponse.CheckoutRequestID,
-
-            resultCode: null,
-
-            resultDescription:
-              stkResponse.CustomerMessage ||
-              stkResponse.ResponseDescription ||
-              "STK Push initiated successfully.",
-
-            verifiedAt: null,
-            paidAt: null,
-          },
-        }),
-      ]);
-    } catch (databaseError) {
-      /*
-       * Safaricom may already have sent the prompt.
-       *
-       * Never tell the customer simply to retry when provider identifiers
-       * could not be stored.
-       */
-      await prisma.paymentAttempt.update({
-        where: {
-          id: paymentAttempt.id,
-        },
-
-        data: {
-          status: "VERIFYING",
-
-          initiationResponseDescription:
-            "Safaricom accepted the request, but its identifiers could not be safely saved.",
-        },
-      });
-
-      console.error("Failed to save M-Pesa request identifiers:", {
-        orderId: order.id,
-
-        paymentAttemptId: paymentAttempt.id,
-
-        code: databaseError.code,
+        message: error.message,
       });
 
       return res.status(500).json({
         success: false,
 
-        message:
-          "The payment request may have been initiated, but its status is uncertain. Do not retry immediately.",
+        message: "M-Pesa authentication failed.",
       });
     }
+  });
+}
 
-    /*
-     * Do not expose Safaricom's internal identifiers to the browser.
-     */
-    return res.status(202).json({
-      success: true,
+/*
+|--------------------------------------------------------------------------
+| POST /api/mpesa/stk-push
+|--------------------------------------------------------------------------
+|
+| The frontend submits only the order ID.
+| The backend retrieves the amount and phone number from PostgreSQL.
+*/
 
-      message:
-        stkResponse.CustomerMessage ||
-        "M-Pesa payment request sent successfully.",
+router.post(
+  "/stk-push",
+  requireTrustedOrigin,
+  stkPushLimiter,
+  async (req, res) => {
+    try {
+      const result = stkPushSchema.safeParse(req.body);
 
-      payment: {
-        orderId: order.id,
-        status: "PENDING",
-      },
-    });
-  } catch (error) {
-    if (error instanceof HttpError) {
-      return res.status(error.statusCode).json({
-        success: false,
+      if (!result.success) {
+        return res.status(400).json({
+          success: false,
+
+          message: "A valid order ID is required.",
+
+          errors: result.error.issues.map((issue) => ({
+            field: issue.path.join("."),
+
+            message: issue.message,
+          })),
+        });
+      }
+
+      const { orderId } = result.data;
+
+      /*
+       * Reserve the attempt before contacting Safaricom.
+       */
+      const { order, paymentAttempt, amount, accountReference } =
+        await reservePaymentAttempt(orderId);
+
+      let stkResponse;
+
+      /*
+       * Contact Safaricom only after database reservation succeeds.
+       */
+      try {
+        stkResponse = await initiateMpesaStkPush({
+          phoneNumber: order.customerPhone,
+
+          amount,
+          accountReference,
+        });
+      } catch (providerError) {
+        const providerErrorMessage = String(
+          providerError.message || "M-Pesa initiation failed.",
+        ).slice(0, 500);
+
+        /*
+         * A network interruption may mean Safaricom received the request
+         * even though the backend did not receive its response.
+         */
+        const resultIsUncertain =
+          /timed out|network|fetch failed|socket|ECONNRESET/i.test(
+            providerErrorMessage,
+          );
+
+        const attemptStatus = resultIsUncertain ? "VERIFYING" : "FAILED";
+
+        await prisma.$transaction([
+          prisma.paymentAttempt.update({
+            where: {
+              id: paymentAttempt.id,
+            },
+
+            data: {
+              status: attemptStatus,
+
+              initiationResponseDescription: providerErrorMessage,
+            },
+          }),
+
+          prisma.payment.updateMany({
+            where: {
+              orderId: order.id,
+
+              status: "PENDING",
+
+              checkoutRequestId: null,
+            },
+
+            data: {
+              status: attemptStatus,
+
+              resultDescription: providerErrorMessage,
+            },
+          }),
+        ]);
+
+        console.error("M-Pesa initiation failed:", {
+          orderId: order.id,
+
+          paymentAttemptId: paymentAttempt.id,
+
+          uncertain: resultIsUncertain,
+        });
+
+        return res.status(resultIsUncertain ? 504 : 502).json({
+          success: false,
+
+          message: resultIsUncertain
+            ? "The payment provider did not respond in time. Do not retry immediately."
+            : "M-Pesa could not initiate the payment request.",
+        });
+      }
+
+      /*
+       * Store Safaricom's identifiers.
+       */
+      try {
+        await prisma.$transaction([
+          prisma.paymentAttempt.update({
+            where: {
+              id: paymentAttempt.id,
+            },
+
+            data: {
+              status: "PENDING",
+
+              merchantRequestId: stkResponse.MerchantRequestID,
+
+              checkoutRequestId: stkResponse.CheckoutRequestID,
+
+              initiationResponseCode: String(stkResponse.ResponseCode),
+
+              initiationResponseDescription:
+                stkResponse.ResponseDescription ||
+                stkResponse.CustomerMessage ||
+                "STK Push initiated successfully.",
+            },
+          }),
+
+          prisma.payment.update({
+            where: {
+              orderId: order.id,
+            },
+
+            data: {
+              status: "PENDING",
+
+              merchantRequestId: stkResponse.MerchantRequestID,
+
+              checkoutRequestId: stkResponse.CheckoutRequestID,
+
+              resultCode: null,
+
+              resultDescription:
+                stkResponse.CustomerMessage ||
+                stkResponse.ResponseDescription ||
+                "STK Push initiated successfully.",
+
+              verifiedAt: null,
+
+              paidAt: null,
+            },
+          }),
+        ]);
+      } catch (databaseError) {
+        /*
+         * Safaricom may already have sent the customer a prompt.
+         */
+        await prisma.paymentAttempt.update({
+          where: {
+            id: paymentAttempt.id,
+          },
+
+          data: {
+            status: "VERIFYING",
+
+            initiationResponseDescription:
+              "Safaricom accepted the request, but its identifiers could not be safely saved.",
+          },
+        });
+
+        console.error("Failed to save M-Pesa request identifiers:", {
+          orderId: order.id,
+
+          paymentAttemptId: paymentAttempt.id,
+
+          code: databaseError.code,
+        });
+
+        return res.status(500).json({
+          success: false,
+
+          message:
+            "The payment request may have been initiated, but its status is uncertain. Do not retry immediately.",
+        });
+      }
+
+      /*
+       * Do not expose provider identifiers to the browser.
+       */
+      return res.status(202).json({
+        success: true,
+
+        message:
+          stkResponse.CustomerMessage ||
+          "M-Pesa payment request sent successfully.",
+
+        payment: {
+          orderId: order.id,
+
+          status: "PENDING",
+        },
+      });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return res.status(error.statusCode).json({
+          success: false,
+
+          message: error.message,
+        });
+      }
+
+      if (error?.code === "P2034") {
+        return res.status(409).json({
+          success: false,
+
+          message:
+            "Another payment request is already being processed for this order.",
+        });
+      }
+
+      console.error("Secure STK Push route error:", {
+        name: error.name,
+
+        code: error.code,
+
         message: error.message,
       });
-    }
 
-    /*
-     * PostgreSQL may abort one of two simultaneous Serializable
-     * transactions. This protects against concurrent duplicate prompts.
-     */
-    if (error?.code === "P2034") {
-      return res.status(409).json({
+      return res.status(500).json({
         success: false,
 
-        message:
-          "Another payment request is already being processed for this order.",
+        message: "The payment request could not be processed safely.",
       });
     }
-
-    console.error("Secure STK Push route error:", {
-      name: error.name,
-      code: error.code,
-      message: error.message,
-    });
-
-    return res.status(500).json({
-      success: false,
-
-      message: "The payment request could not be processed safely.",
-    });
-  }
-});
+  },
+);
 
 /*
 |--------------------------------------------------------------------------
 | POST /api/mpesa/callback/:token
 |--------------------------------------------------------------------------
-| The callback URL contains a high-entropy secret token because Safaricom
-| callbacks do not use our normal application authentication cookie.
 |
-| A callback is treated as a claim, not immediate proof. We store it,
-| deduplicate it, match it to a PaymentAttempt, and query Safaricom before
-| applying a final payment state.
+| Safaricom does not use the application's authentication cookie.
+|
+| The callback is treated as a claim, not unquestionable proof. It is:
+| - Validated
+| - Stored
+| - Deduplicated
+| - Matched to a PaymentAttempt
+| - Checked against Safaricom's STK query response
 */
 
-router.post("/callback/:token", async (req, res) => {
+router.post("/callback/:token", mpesaCallbackLimiter, async (req, res) => {
   let callbackEvent = null;
 
   try {
@@ -804,14 +922,13 @@ router.post("/callback/:token", async (req, res) => {
     if (!callbackTokenMatches(providedCallbackToken)) {
       return res.status(404).json({
         ResultCode: 1,
+
         ResultDesc: "Callback endpoint not found.",
       });
     }
 
     /*
-     * Redact the valid secret from logs such as Morgan's :url.
-     * Express has already matched the route, so changing it here
-     * does not affect routing.
+     * Redact the valid secret from request logs.
      */
     req.originalUrl = req.originalUrl.replace(
       providedCallbackToken,
@@ -825,6 +942,7 @@ router.post("/callback/:token", async (req, res) => {
     if (!validationResult.success) {
       return res.status(400).json({
         ResultCode: 1,
+
         ResultDesc: "Invalid callback structure.",
       });
     }
@@ -854,8 +972,7 @@ router.post("/callback/:token", async (req, res) => {
     });
 
     /*
-     * Store only normalized, limited audit data.
-     * Avoid storing or logging the complete raw request body.
+     * Store normalized, limited audit data only.
      */
     const normalizedAuditPayload = {
       merchantRequestId: MerchantRequestID,
@@ -896,13 +1013,13 @@ router.post("/callback/:token", async (req, res) => {
     if (callbackEventResult.alreadyHandled) {
       return res.status(200).json({
         ResultCode: 0,
+
         ResultDesc: "Callback already processed.",
       });
     }
 
     /*
-     * Match the callback against the historical payment attempt,
-     * not merely the current summary Payment record.
+     * Match against PaymentAttempt history.
      */
     const paymentAttempt = await findPaymentAttemptWithRetry(CheckoutRequestID);
 
@@ -939,8 +1056,7 @@ router.post("/callback/:token", async (req, res) => {
     });
 
     /*
-     * Both provider IDs must match the attempt originally stored
-     * when the STK Push was initiated.
+     * Both provider IDs must match the reserved attempt.
      */
     if (
       paymentAttempt.merchantRequestId !== MerchantRequestID ||
@@ -963,9 +1079,7 @@ router.post("/callback/:token", async (req, res) => {
     }
 
     /*
-     * Independently ask Safaricom for the status.
-     *
-     * The callback itself is not treated as unquestionable proof.
+     * Independently query Safaricom.
      */
     let providerStatus;
 
@@ -1109,7 +1223,7 @@ router.post("/callback/:token", async (req, res) => {
     }
 
     /*
-     * A successful transaction requires complete callback metadata.
+     * Successful callbacks require complete metadata.
      */
     const amountPaid = Number(metadata.Amount);
 
@@ -1190,8 +1304,8 @@ router.post("/callback/:token", async (req, res) => {
       }
 
       /*
-       * An already successful callback is harmless only when all
-       * successful transaction identifiers agree.
+       * An already successful attempt is harmless only when
+       * its successful identifiers match.
        */
       if (currentAttempt.status === "SUCCESS") {
         const sameSuccessfulPayment =
@@ -1224,7 +1338,7 @@ router.post("/callback/:token", async (req, res) => {
       }
 
       /*
-       * Only unresolved payment attempts may automatically succeed.
+       * Only unresolved attempts may become successful automatically.
        */
       if (!["PENDING", "VERIFYING"].includes(currentAttempt.status)) {
         throw new Error(
@@ -1233,8 +1347,7 @@ router.post("/callback/:token", async (req, res) => {
       }
 
       /*
-       * A callback must never silently change an already progressed,
-       * cancelled or otherwise non-pending order into PAID.
+       * Only a pending order may be marked paid by the callback.
        */
       if (currentAttempt.order.status !== "PENDING") {
         throw new Error(
@@ -1243,8 +1356,7 @@ router.post("/callback/:token", async (req, res) => {
       }
 
       /*
-       * Explicitly check receipt reuse before writing.
-       * Database uniqueness constraints provide another layer.
+       * Check for receipt reuse.
        */
       const receiptUsedByAnotherAttempt =
         await transaction.paymentAttempt.findFirst({
@@ -1310,6 +1422,7 @@ router.post("/callback/:token", async (req, res) => {
 
         update: {
           method: "MPESA",
+
           status: "SUCCESS",
 
           amount: currentAttempt.amount,
@@ -1335,6 +1448,7 @@ router.post("/callback/:token", async (req, res) => {
           orderId: currentAttempt.orderId,
 
           method: "MPESA",
+
           status: "SUCCESS",
 
           amount: currentAttempt.amount,
@@ -1399,7 +1513,7 @@ router.post("/callback/:token", async (req, res) => {
     });
   } catch (error) {
     /*
-     * Preserve processing failures in the callback audit table.
+     * Preserve processing failures in the audit table.
      */
     if (callbackEvent) {
       try {
@@ -1427,7 +1541,9 @@ router.post("/callback/:token", async (req, res) => {
 
     console.error("Secure M-Pesa callback processing error:", {
       name: error.name,
+
       code: error.code,
+
       message: error.message,
     });
 
