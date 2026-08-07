@@ -261,6 +261,15 @@ router.post(
         });
       }
 
+      if (!user.emailVerifiedAt) {
+        return res.status(403).json({
+          success: false,
+          code: "EMAIL_NOT_VERIFIED",
+
+          message: "Please verify your email address before logging in.",
+        });
+      }
+
       /*
        * Create the database session first.
        */

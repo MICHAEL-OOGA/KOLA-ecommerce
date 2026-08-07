@@ -14,7 +14,6 @@ import productRoutes from "./routes/product.routes.js";
 import orderRoutes from "./routes/order.routes.js";
 import mpesaRoutes from "./routes/mpesa.routes.js";
 import passwordResetRoutes from "./routes/password-reset.routes.js";
-
 import {
   API_RATE_LIMIT_MAX,
   ENFORCE_HTTPS,
@@ -23,7 +22,7 @@ import {
   TRUST_PROXY_HOPS,
   isTrustedClientOrigin,
 } from "./config/http.config.js";
-
+import accountRoutes from "./routes/account.routes.js";
 const app = express();
 
 app.disable("x-powered-by");
@@ -282,6 +281,7 @@ app.use(
   },
   authRoutes,
   passwordResetRoutes,
+  accountRoutes,
 );
 
 app.use("/api/categories", categoryRoutes);

@@ -88,13 +88,20 @@ export const PASSWORD_RESET_SECRET = readRequiredSecret(
   "PASSWORD_RESET_SECRET",
 );
 
-if (
-  JWT_SECRET === CSRF_SECRET ||
-  JWT_SECRET === PASSWORD_RESET_SECRET ||
-  CSRF_SECRET === PASSWORD_RESET_SECRET
-) {
+export const EMAIL_VERIFICATION_SECRET = readRequiredSecret(
+  "EMAIL_VERIFICATION_SECRET",
+);
+
+const authenticationSecrets = [
+  JWT_SECRET,
+  CSRF_SECRET,
+  PASSWORD_RESET_SECRET,
+  EMAIL_VERIFICATION_SECRET,
+];
+
+if (new Set(authenticationSecrets).size !== authenticationSecrets.length) {
   throw new Error(
-    "JWT_SECRET, CSRF_SECRET and PASSWORD_RESET_SECRET must all be different.",
+    "JWT_SECRET, CSRF_SECRET, PASSWORD_RESET_SECRET and EMAIL_VERIFICATION_SECRET must all be different.",
   );
 }
 
@@ -129,6 +136,13 @@ export const PASSWORD_RESET_MINUTES = readBoundedIntegerEnv(
   60,
 );
 
+export const EMAIL_VERIFICATION_MINUTES = readBoundedIntegerEnv(
+  "EMAIL_VERIFICATION_MINUTES",
+  60,
+  10,
+  1440,
+);
+
 const isProduction = process.env.NODE_ENV === "production";
 
 export const PASSWORD_RESET_DEV_EXPOSE_TOKEN = readBooleanEnv(
@@ -136,9 +150,20 @@ export const PASSWORD_RESET_DEV_EXPOSE_TOKEN = readBooleanEnv(
   false,
 );
 
+export const EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN = readBooleanEnv(
+  "EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN",
+  false,
+);
+
 if (isProduction && PASSWORD_RESET_DEV_EXPOSE_TOKEN) {
   throw new Error(
     "PASSWORD_RESET_DEV_EXPOSE_TOKEN cannot be enabled in production.",
+  );
+}
+
+if (isProduction && EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN) {
+  throw new Error(
+    "EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN cannot be enabled in production.",
   );
 }
 
