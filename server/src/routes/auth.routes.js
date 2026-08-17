@@ -24,6 +24,8 @@ import {
   getAuthCookieOptions,
 } from "../config/auth.config.js";
 
+import { recordSecurityAuditEvent } from "../services/security-audit.service.js";
+
 const router = express.Router();
 
 /*
@@ -255,15 +257,47 @@ router.post(
       const passwordMatches = await bcrypt.compare(password, passwordHash);
 
       if (!user || !passwordMatches) {
+        await recordSecurityAuditEvent({
+          req,
+
+          eventType: "LOGIN_FAILED",
+
+          outcome: "FAILURE",
+
+          identifier: email,
+
+          resourceType: "AUTHENTICATION",
+        });
+
         return res.status(401).json({
           success: false,
+
           message: "Invalid email or password.",
         });
       }
 
       if (!user.emailVerifiedAt) {
+        await recordSecurityAuditEvent({
+          req,
+
+          eventType: "LOGIN_DENIED_UNVERIFIED",
+
+          outcome: "DENIED",
+
+          userId: user.id,
+
+          actorRole: user.role,
+
+          identifier: email,
+
+          resourceType: "USER",
+
+          resourceId: user.id,
+        });
+
         return res.status(403).json({
           success: false,
+
           code: "EMAIL_NOT_VERIFIED",
 
           message: "Please verify your email address before logging in.",
@@ -290,6 +324,23 @@ router.post(
 
       res.cookie(AUTH_COOKIE_NAME, token, getAuthCookieOptions());
 
+      await recordSecurityAuditEvent({
+        req,
+
+        eventType: "LOGIN_SUCCESS",
+
+        outcome: "SUCCESS",
+
+        userId: user.id,
+
+        actorRole: user.role,
+
+        identifier: email,
+
+        resourceType: "AUTH_SESSION",
+
+        resourceId: session.id,
+      });
       return res.status(200).json({
         success: true,
         message: "Login successful.",
@@ -391,6 +442,26 @@ router.post("/logout", protect, requireCsrf, async (req, res) => {
         revokedAt,
 
         revocationReason: "USER_LOGOUT",
+      },
+    });
+
+    await recordSecurityAuditEvent({
+      req,
+
+      eventType: "LOGOUT_SUCCESS",
+
+      outcome: "SUCCESS",
+
+      userId: req.user.id,
+
+      actorRole: req.user.role,
+
+      resourceType: "AUTH_SESSION",
+
+      resourceId: req.auth.sessionId,
+
+      metadata: {
+        reason: "USER_LOGOUT",
       },
     });
 

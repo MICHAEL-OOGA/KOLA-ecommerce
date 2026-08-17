@@ -17,6 +17,11 @@ import {
   EMAIL_VERIFICATION_SECRET,
 } from "../config/auth.config.js";
 
+import {
+  recordSecurityAuditEvent,
+  writeSecurityAuditEvent,
+} from "../services/security-audit.service.js";
+
 const router = express.Router();
 
 /*
@@ -400,6 +405,17 @@ router.post(
       const { fullName, email, phone, password } = validationResult.data;
 
       if (isDisposableEmail(email)) {
+        await recordSecurityAuditEvent({
+          req,
+
+          eventType: "REGISTRATION_DENIED_DISPOSABLE_EMAIL",
+
+          outcome: "DENIED",
+
+          identifier: email,
+
+          resourceType: "REGISTRATION",
+        });
         return res.status(400).json({
           success: false,
 
@@ -468,6 +484,26 @@ router.post(
               requestIp: req.ip,
 
               currentTime,
+            });
+
+            await writeSecurityAuditEvent({
+              database: transaction,
+
+              req,
+
+              eventType: "USER_REGISTERED",
+
+              outcome: "SUCCESS",
+
+              userId: user.id,
+
+              actorRole: "CUSTOMER",
+
+              identifier: email,
+
+              resourceType: "USER",
+
+              resourceId: user.id,
             });
 
             return {
@@ -608,6 +644,22 @@ router.post(
           },
         });
 
+        await writeSecurityAuditEvent({
+          database: transaction,
+
+          req,
+
+          eventType: "EMAIL_VERIFIED",
+
+          outcome: "SUCCESS",
+
+          userId: verificationToken.userId,
+
+          resourceType: "USER",
+
+          resourceId: verificationToken.userId,
+        });
+
         await transaction.emailVerificationToken.updateMany({
           where: {
             userId: verificationToken.userId,
@@ -705,8 +757,8 @@ router.post(
         const currentTime = new Date();
 
         const rawToken = await runSerializableTransactionWithRetry(
-          (transaction) =>
-            createVerificationTokenRecord({
+          async (transaction) => {
+            const token = await createVerificationTokenRecord({
               transaction,
 
               userId: user.id,
@@ -714,7 +766,26 @@ router.post(
               requestIp: req.ip,
 
               currentTime,
-            }),
+            });
+
+            await writeSecurityAuditEvent({
+              database: transaction,
+
+              req,
+
+              eventType: "EMAIL_VERIFICATION_REISSUED",
+
+              outcome: "SUCCESS",
+
+              userId: user.id,
+
+              resourceType: "USER",
+
+              resourceId: user.id,
+            });
+
+            return token;
+          },
         );
 
         if (EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN) {

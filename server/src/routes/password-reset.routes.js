@@ -19,6 +19,11 @@ import {
   getAuthCookieClearOptions,
 } from "../config/auth.config.js";
 
+import {
+  recordSecurityAuditEvent,
+  writeSecurityAuditEvent,
+} from "../services/security-audit.service.js";
+
 const router = express.Router();
 
 /*
@@ -369,6 +374,18 @@ router.post(
         response.expiresInMinutes = PASSWORD_RESET_MINUTES;
       }
 
+      await recordSecurityAuditEvent({
+        req,
+
+        eventType: "PASSWORD_RESET_REQUESTED",
+
+        outcome: "SUCCESS",
+
+        identifier: email,
+
+        resourceType: "PASSWORD_RESET",
+      });
+
       return res.status(200).json(response);
     } catch (error) {
       console.error("Forgot-password error:", {
@@ -521,6 +538,26 @@ router.post(
         });
       });
 
+      await writeSecurityAuditEvent({
+        database: transaction,
+
+        req,
+
+        eventType: "PASSWORD_RESET_SUCCESS",
+
+        outcome: "SUCCESS",
+
+        userId: resetToken.userId,
+
+        resourceType: "USER",
+
+        resourceId: resetToken.userId,
+
+        metadata: {
+          activeSessionsRevoked: true,
+        },
+      });
+
       /*
        * Remove any authentication cookie currently held by the browser.
        */
@@ -534,6 +571,15 @@ router.post(
       });
     } catch (error) {
       if (error instanceof InvalidResetTokenError) {
+        await recordSecurityAuditEvent({
+          req,
+
+          eventType: "PASSWORD_RESET_FAILED",
+
+          outcome: "FAILURE",
+
+          resourceType: "PASSWORD_RESET",
+        });
         return res.status(400).json({
           success: false,
 

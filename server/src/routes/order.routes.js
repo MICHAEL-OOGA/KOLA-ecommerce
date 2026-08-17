@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { protect, adminOnly } from "../middleware/auth.middleware.js";
 import { getOrderExpiryDate } from "../services/order-expiry.service.js";
 import { requireCsrf } from "../middleware/csrf.middleware.js";
+import { writeSecurityAuditEvent } from "../services/security-audit.service.js";
 const { Prisma } = PrismaPackage;
 const router = express.Router();
 
@@ -1156,6 +1157,28 @@ router.patch(
               include: adminOrderResponseInclude,
             });
 
+            await writeSecurityAuditEvent({
+              database: transaction,
+
+              req,
+
+              eventType: "ORDER_STATUS_CHANGED",
+
+              outcome: "SUCCESS",
+
+              resourceType: "ORDER",
+
+              resourceId: existingOrder.id,
+
+              metadata: {
+                fromStatus: existingOrder.status,
+
+                toStatus: "CANCELLED",
+
+                stockRestored: true,
+              },
+            });
+
             return {
               order: cancelledOrder,
               unchanged: false,
@@ -1216,6 +1239,27 @@ router.patch(
             include: adminOrderResponseInclude,
           });
 
+          await writeSecurityAuditEvent({
+            database: transaction,
+
+            req,
+
+            eventType: "ORDER_STATUS_CHANGED",
+
+            outcome: "SUCCESS",
+
+            resourceType: "ORDER",
+
+            resourceId: existingOrder.id,
+
+            metadata: {
+              fromStatus: existingOrder.status,
+
+              toStatus: requestedStatus,
+
+              stockRestored: false,
+            },
+          });
           return {
             order: updatedOrder,
             unchanged: false,

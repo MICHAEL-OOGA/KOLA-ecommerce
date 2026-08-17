@@ -2,6 +2,7 @@ import express from "express";
 import { z } from "zod";
 import prisma from "../config/prisma.js";
 import { protect, adminOnly } from "../middleware/auth.middleware.js";
+import { writeSecurityAuditEvent } from "../services/security-audit.service.js";
 import { requireCsrf } from "../middleware/csrf.middleware.js";
 const router = express.Router();
 
@@ -299,27 +300,58 @@ router.post("/", protect, adminOnly, requireCsrf, async (req, res) => {
       }
     }
 
-    const product = await prisma.product.create({
-      data: {
-        name,
-        slug,
-        description: description || null,
-        price,
-        stock,
-        imageUrl: imageUrl || null,
-        categoryId: categoryId || null,
-        isActive: isActive ?? true,
-      },
+    const product = await prisma.$transaction(async (transaction) => {
+      const createdProduct = await transaction.product.create({
+        data: {
+          name,
+          slug,
 
-      include: {
-        category: {
-          select: {
-            id: true,
-            name: true,
-            slug: true,
+          description: description || null,
+
+          price,
+          stock,
+
+          imageUrl: imageUrl || null,
+
+          categoryId: categoryId || null,
+
+          isActive: isActive ?? true,
+        },
+
+        include: {
+          category: {
+            select: {
+              id: true,
+              name: true,
+              slug: true,
+            },
           },
         },
-      },
+      });
+
+      await writeSecurityAuditEvent({
+        database: transaction,
+
+        req,
+
+        eventType: "PRODUCT_CREATED",
+
+        outcome: "SUCCESS",
+
+        resourceType: "PRODUCT",
+
+        resourceId: createdProduct.id,
+
+        metadata: {
+          slug: createdProduct.slug,
+
+          categoryId: createdProduct.categoryId,
+
+          initialStock: createdProduct.stock,
+        },
+      });
+
+      return createdProduct;
     });
 
     return res.status(201).json({
@@ -419,22 +451,44 @@ router.patch("/:id", protect, adminOnly, requireCsrf, async (req, res) => {
       }
     }
 
-    const updatedProduct = await prisma.product.update({
-      where: {
-        id,
-      },
+    const updatedProduct = await prisma.$transaction(async (transaction) => {
+      const product = await transaction.product.update({
+        where: {
+          id,
+        },
 
-      data: result.data,
+        data: result.data,
 
-      include: {
-        category: {
-          select: {
-            id: true,
-            name: true,
-            slug: true,
+        include: {
+          category: {
+            select: {
+              id: true,
+              name: true,
+              slug: true,
+            },
           },
         },
-      },
+      });
+
+      await writeSecurityAuditEvent({
+        database: transaction,
+
+        req,
+
+        eventType: "PRODUCT_UPDATED",
+
+        outcome: "SUCCESS",
+
+        resourceType: "PRODUCT",
+
+        resourceId: product.id,
+
+        metadata: {
+          changedFields: Object.keys(result.data),
+        },
+      });
+
+      return product;
     });
 
     return res.status(200).json({
@@ -495,15 +549,39 @@ router.delete("/:id", protect, adminOnly, requireCsrf, async (req, res) => {
       });
     }
 
-    const deactivatedProduct = await prisma.product.update({
-      where: {
-        id,
-      },
+    const deactivatedProduct = await prisma.$transaction(
+      async (transaction) => {
+        const updatedProduct = await transaction.product.update({
+          where: {
+            id,
+          },
 
-      data: {
-        isActive: false,
+          data: {
+            isActive: false,
+          },
+        });
+
+        await writeSecurityAuditEvent({
+          database: transaction,
+
+          req,
+
+          eventType: "PRODUCT_DEACTIVATED",
+
+          outcome: "SUCCESS",
+
+          resourceType: "PRODUCT",
+
+          resourceId: updatedProduct.id,
+
+          metadata: {
+            slug: updatedProduct.slug,
+          },
+        });
+
+        return updatedProduct;
       },
-    });
+    );
 
     return res.status(200).json({
       success: true,

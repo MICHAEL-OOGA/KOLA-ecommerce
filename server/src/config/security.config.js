@@ -51,6 +51,26 @@ const readBooleanEnvironment = (name, fallback = false) => {
   throw new Error(`${name} must be true or false.`);
 };
 
+const readBoundedIntegerEnvironment = (name, fallback, minimum, maximum) => {
+  const rawValue = readEnvironmentValue(name);
+
+  if (!rawValue) {
+    return fallback;
+  }
+
+  if (!/^\d+$/.test(rawValue)) {
+    throw new Error(`${name} must be a positive whole number.`);
+  }
+
+  const value = Number(rawValue);
+
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be between ${minimum} and ${maximum}.`);
+  }
+
+  return value;
+};
+
 const validatePostgresUrl = (name, { requireTls = false } = {}) => {
   const rawValue = readEnvironmentValue(name);
 
@@ -179,6 +199,27 @@ export const RUNTIME_ENV =
 export const IS_RUNTIME_PRODUCTION = RUNTIME_ENV === "production";
 
 export const AUDIT_HASH_SECRET = readRequiredSecret("AUDIT_HASH_SECRET");
+
+export const SECURITY_CLEANUP_INTERVAL_MINUTES = readBoundedIntegerEnvironment(
+  "SECURITY_CLEANUP_INTERVAL_MINUTES",
+  60,
+  5,
+  1440,
+);
+
+export const AUTH_SESSION_RETENTION_DAYS = readBoundedIntegerEnvironment(
+  "AUTH_SESSION_RETENTION_DAYS",
+  30,
+  1,
+  365,
+);
+
+export const SECURITY_TOKEN_RETENTION_HOURS = readBoundedIntegerEnvironment(
+  "SECURITY_TOKEN_RETENTION_HOURS",
+  24,
+  1,
+  720,
+);
 
 /*
 |--------------------------------------------------------------------------

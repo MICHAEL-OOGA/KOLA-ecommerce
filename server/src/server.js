@@ -7,6 +7,10 @@ import {
   stopOrderExpiryWorker,
 } from "./services/order-expiry.service.js";
 import { validateRuntimeSecurityConfiguration } from "./config/security.config.js";
+import {
+  startSecurityCleanupWorker,
+  stopSecurityCleanupWorker,
+} from "./services/security-cleanup.service.js";
 
 /*
 |--------------------------------------------------------------------------
@@ -26,6 +30,8 @@ const server = app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 
   startOrderExpiryWorker();
+
+  startSecurityCleanupWorker();
 });
 
 /*
@@ -70,6 +76,7 @@ const shutdown = (signal, exitCode = 0) => {
   console.log(`${signal} received. Shutting down safely...`);
 
   stopOrderExpiryWorker();
+  stopSecurityCleanupWorker();
 
   const forcedShutdownTimer = setTimeout(() => {
     console.error("Forced shutdown after waiting for active requests.");

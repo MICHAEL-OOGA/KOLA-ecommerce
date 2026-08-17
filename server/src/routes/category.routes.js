@@ -3,6 +3,7 @@ import { z } from "zod";
 import prisma from "../config/prisma.js";
 import { protect, adminOnly } from "../middleware/auth.middleware.js";
 import { requireCsrf } from "../middleware/csrf.middleware.js";
+import { writeSecurityAuditEvent } from "../services/security-audit.service.js";
 const router = express.Router();
 
 const createCategorySchema = z
@@ -104,11 +105,33 @@ router.post("/", protect, adminOnly, requireCsrf, async (req, res) => {
       });
     }
 
-    const category = await prisma.category.create({
-      data: {
-        name,
-        slug,
-      },
+    const category = await prisma.$transaction(async (transaction) => {
+      const createdCategory = await transaction.category.create({
+        data: {
+          name,
+          slug,
+        },
+      });
+
+      await writeSecurityAuditEvent({
+        database: transaction,
+
+        req,
+
+        eventType: "CATEGORY_CREATED",
+
+        outcome: "SUCCESS",
+
+        resourceType: "CATEGORY",
+
+        resourceId: createdCategory.id,
+
+        metadata: {
+          slug: createdCategory.slug,
+        },
+      });
+
+      return createdCategory;
     });
 
     return res.status(201).json({
@@ -191,9 +214,34 @@ router.patch("/:id", protect, adminOnly, requireCsrf, async (req, res) => {
       }
     }
 
-    const updatedCategory = await prisma.category.update({
-      where: { id },
-      data: result.data,
+    const updatedCategory = await prisma.$transaction(async (transaction) => {
+      const updated = await transaction.category.update({
+        where: {
+          id,
+        },
+
+        data: result.data,
+      });
+
+      await writeSecurityAuditEvent({
+        database: transaction,
+
+        req,
+
+        eventType: "CATEGORY_UPDATED",
+
+        outcome: "SUCCESS",
+
+        resourceType: "CATEGORY",
+
+        resourceId: updated.id,
+
+        metadata: {
+          changedFields: Object.keys(result.data),
+        },
+      });
+
+      return updated;
     });
 
     return res.status(200).json({
@@ -245,23 +293,48 @@ router.delete("/:id", protect, adminOnly, requireCsrf, async (req, res) => {
     });
 
     if (!category) {
-      if (category._count.products > 0) {
-        return res.status(409).json({
-          success: false,
-          code: "CATEGORY_NOT_EMPTY",
-
-          message:
-            "This category cannot be deleted while products are assigned to it.",
-        });
-      }
       return res.status(404).json({
         success: false,
+
         message: "Category not found.",
       });
     }
 
-    await prisma.category.delete({
-      where: { id },
+    if (category._count.products > 0) {
+      return res.status(409).json({
+        success: false,
+
+        code: "CATEGORY_NOT_EMPTY",
+
+        message:
+          "This category cannot be deleted while products are assigned to it.",
+      });
+    }
+
+    await prisma.$transaction(async (transaction) => {
+      await transaction.category.delete({
+        where: {
+          id,
+        },
+      });
+
+      await writeSecurityAuditEvent({
+        database: transaction,
+
+        req,
+
+        eventType: "CATEGORY_DELETED",
+
+        outcome: "SUCCESS",
+
+        resourceType: "CATEGORY",
+
+        resourceId: category.id,
+
+        metadata: {
+          categoryName: category.name,
+        },
+      });
     });
 
     return res.status(200).json({
