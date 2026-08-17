@@ -6,6 +6,17 @@ import {
   startOrderExpiryWorker,
   stopOrderExpiryWorker,
 } from "./services/order-expiry.service.js";
+import { validateRuntimeSecurityConfiguration } from "./config/security.config.js";
+
+/*
+|--------------------------------------------------------------------------
+| Fail-fast runtime security validation
+|--------------------------------------------------------------------------
+*/
+
+validateRuntimeSecurityConfiguration();
+
+console.log("Runtime security configuration validated.");
 
 const PORT = Number(process.env.PORT) || 5000;
 

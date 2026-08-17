@@ -37,6 +37,13 @@ enum CallbackProcessingStatus {
   ERROR
 }
 
+enum SecurityAuditOutcome {
+  SUCCESS
+  FAILURE
+  DENIEDs
+  ERROR
+}
+
 model AuthSession {
   id String @id @default(cuid())
 
@@ -109,6 +116,7 @@ model User {
   sessions                AuthSession[]
   passwordResetTokens     PasswordResetToken[]
   emailVerificationTokens EmailVerificationToken[]
+  securityAuditLogs       SecurityAuditLog[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -260,6 +268,36 @@ model PaymentAttempt {
 
   @@index([orderId, createdAt])
   @@index([status])
+}
+
+model SecurityAuditLog {
+  id String @id @default(cuid())
+
+  eventType String               @db.VarChar(80)
+  outcome   SecurityAuditOutcome
+
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  actorRole Role?
+
+  requestId String? @db.VarChar(100)
+
+  ipHash         String? @db.VarChar(64)
+  userAgentHash  String? @db.VarChar(64)
+  identifierHash String? @db.VarChar(64)
+
+  resourceType String? @db.VarChar(64)
+  resourceId   String? @db.VarChar(191)
+
+  metadata Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([eventType, createdAt])
+  @@index([userId, createdAt])
+  @@index([outcome, createdAt])
+  @@index([resourceType, resourceId, createdAt])
 }
 
 model MpesaCallbackEvent {
