@@ -1,7 +1,12 @@
 import express from "express";
 import bcrypt from "bcryptjs";
 
-import { createHash, createHmac, randomBytes } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  randomInt,
+  timingSafeEqual,
+} from "node:crypto";
 
 import { rateLimit, ipKeyGenerator } from "express-rate-limit";
 
@@ -22,15 +27,34 @@ import {
   writeSecurityAuditEvent,
 } from "../services/security-audit.service.js";
 
+import { sendVerificationEmail } from "../services/email.service.js";
+
 const router = express.Router();
+
+/*
+|--------------------------------------------------------------------------
+| Email-verification OTP configuration
+|--------------------------------------------------------------------------
+|
+| We deliberately exclude visually confusing characters:
+|
+| I, L, O, 0, 1
+|
+| Example:
+|
+| K7M4Q2P9
+*/
+
+const VERIFICATION_CODE_LENGTH = 8;
+
+const VERIFICATION_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+const MAX_VERIFICATION_ATTEMPTS = 5;
 
 /*
 |--------------------------------------------------------------------------
 | Disposable-email screening
 |--------------------------------------------------------------------------
-|
-| This list is an additional filter, not a replacement for verification.
-| New disposable-email services appear frequently.
 */
 
 const builtInDisposableDomains = [
@@ -126,17 +150,46 @@ const registerSchema = z
   .strict()
   .refine((data) => data.password === data.confirmPassword, {
     path: ["confirmPassword"],
-
     message: "Password confirmation does not match.",
   });
 
-const verificationTokenSchema = z
+/*
+|--------------------------------------------------------------------------
+| Verification schema
+|--------------------------------------------------------------------------
+|
+| Verification now requires BOTH:
+|
+| email
+| code
+|
+| Example:
+|
+| michael@example.com
+| K7M4Q2P9
+*/
+
+const verificationCodeSchema = z
   .object({
-    token: z
+    email: z
       .string()
       .trim()
-      .regex(/^[a-f0-9]{64}$/i, "The email-verification token is invalid.")
-      .transform((token) => token.toLowerCase()),
+      .toLowerCase()
+      .max(254, "Email address is too long.")
+      .email("Enter a valid email address."),
+
+    code: z
+      .string()
+      .trim()
+      .toUpperCase()
+      .length(
+        VERIFICATION_CODE_LENGTH,
+        `Verification code must contain exactly ${VERIFICATION_CODE_LENGTH} characters.`,
+      )
+      .regex(
+        /^[A-HJ-KM-NP-Z2-9]+$/,
+        "The verification code contains invalid characters.",
+      ),
   })
   .strict();
 
@@ -154,7 +207,6 @@ const resendVerificationSchema = z
 const formatValidationErrors = (issues) =>
   issues.map((issue) => ({
     field: issue.path.join("."),
-
     message: issue.message,
   }));
 
@@ -164,10 +216,16 @@ const formatValidationErrors = (issues) =>
 |--------------------------------------------------------------------------
 */
 
+const isProduction = process.env.NODE_ENV === "production";
+
+const REGISTER_IP_MAX = isProduction ? 10 : 100;
+
+const REGISTER_EMAIL_MAX = isProduction ? 3 : 30;
+
 const registerIpLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
 
-  max: 10,
+  max: REGISTER_IP_MAX,
 
   standardHeaders: true,
   legacyHeaders: false,
@@ -194,7 +252,7 @@ const getEmailHash = (req) => {
 const registerEmailLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
 
-  max: 3,
+  max: REGISTER_EMAIL_MAX,
 
   standardHeaders: true,
   legacyHeaders: false,
@@ -208,6 +266,17 @@ const registerEmailLimiter = rateLimit({
       message: "Too many registration attempts. Please try again later.",
     }),
 });
+
+/*
+|--------------------------------------------------------------------------
+| Verification request rate limiter
+|--------------------------------------------------------------------------
+|
+| This protects the endpoint broadly by IP.
+|
+| The individual OTP itself also has a maximum of
+| five wrong guesses.
+*/
 
 const verificationIpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -265,19 +334,53 @@ const resendEmailLimiter = rateLimit({
 
 /*
 |--------------------------------------------------------------------------
-| Token helpers
+| Verification-code helpers
 |--------------------------------------------------------------------------
 */
 
-const createRawVerificationToken = () => randomBytes(32).toString("hex");
+/*
+ * Generates one cryptographically secure
+ * 8-character verification code.
+ *
+ * We use crypto.randomInt(), NOT Math.random().
+ */
+
+const createRawVerificationCode = () => {
+  let code = "";
+
+  for (let index = 0; index < VERIFICATION_CODE_LENGTH; index += 1) {
+    const randomIndex = randomInt(0, VERIFICATION_CODE_ALPHABET.length);
+
+    code += VERIFICATION_CODE_ALPHABET[randomIndex];
+  }
+
+  return code;
+};
 
 const createSensitiveHash = (namespace, value) =>
   createHmac("sha256", EMAIL_VERIFICATION_SECRET)
     .update(`${namespace}:${value}`)
     .digest("hex");
 
-const hashVerificationToken = (token) =>
-  createSensitiveHash("email-verification-token", token);
+/*
+|--------------------------------------------------------------------------
+| Verification hash
+|--------------------------------------------------------------------------
+|
+| We bind the verification code to the email address.
+|
+| Therefore:
+|
+| michael@example.com + K7M4Q2P9
+|
+| produces a different HMAC than:
+|
+| another@example.com + K7M4Q2P9
+|
+*/
+
+const hashVerificationCode = (email, code) =>
+  createSensitiveHash("email-verification-code", `${email}:${code}`);
 
 const hashRequestIp = (requestIp) => {
   if (typeof requestIp !== "string" || !requestIp) {
@@ -287,18 +390,54 @@ const hashRequestIp = (requestIp) => {
   return createSensitiveHash("email-verification-ip", requestIp);
 };
 
-const createVerificationTokenRecord = async ({
+/*
+|--------------------------------------------------------------------------
+| Constant-time hash comparison
+|--------------------------------------------------------------------------
+*/
+
+const hashesMatch = (firstHash, secondHash) => {
+  if (typeof firstHash !== "string" || typeof secondHash !== "string") {
+    return false;
+  }
+
+  if (firstHash.length !== secondHash.length) {
+    return false;
+  }
+
+  try {
+    return timingSafeEqual(
+      Buffer.from(firstHash, "hex"),
+      Buffer.from(secondHash, "hex"),
+    );
+  } catch {
+    return false;
+  }
+};
+
+/*
+|--------------------------------------------------------------------------
+| Create verification record
+|--------------------------------------------------------------------------
+*/
+
+const createVerificationCodeRecord = async ({
   transaction,
   userId,
+  email,
   requestIp,
   currentTime,
 }) => {
-  const rawToken = createRawVerificationToken();
+  const rawCode = createRawVerificationCode();
 
   const expiresAt = new Date(
     currentTime.getTime() + EMAIL_VERIFICATION_MINUTES * 60 * 1000,
   );
 
+  /*
+   * Issuing a new code invalidates every
+   * previous unused code.
+   */
   await transaction.emailVerificationToken.updateMany({
     where: {
       userId,
@@ -314,15 +453,17 @@ const createVerificationTokenRecord = async ({
     data: {
       userId,
 
-      tokenHash: hashVerificationToken(rawToken),
+      tokenHash: hashVerificationCode(email, rawCode),
 
       expiresAt,
+
+      failedAttempts: 0,
 
       requestedIpHash: hashRequestIp(requestIp),
     },
   });
 
-  return rawToken;
+  return rawCode;
 };
 
 /*
@@ -355,26 +496,24 @@ const runSerializableTransactionWithRetry = async (
   }
 };
 
-class InvalidVerificationTokenError extends Error {
-  constructor() {
-    super("The email-verification token is invalid or expired.");
-
-    this.name = "InvalidVerificationTokenError";
-  }
-}
+/*
+|--------------------------------------------------------------------------
+| Generic responses
+|--------------------------------------------------------------------------
+*/
 
 const GENERIC_REGISTRATION_RESPONSE = {
   success: true,
 
   message:
-    "If this email address can be registered, verification instructions will be sent.",
+    "If this email address can be registered, a verification code will be sent.",
 };
 
 const GENERIC_RESEND_RESPONSE = {
   success: true,
 
   message:
-    "If an unverified account exists for that email address, verification instructions will be sent.",
+    "If an unverified account exists for that email address, a verification code will be sent.",
 };
 
 /*
@@ -385,9 +524,11 @@ const GENERIC_RESEND_RESPONSE = {
 
 router.post(
   "/register",
+
   requireTrustedOrigin,
   registerIpLimiter,
   registerEmailLimiter,
+
   async (req, res) => {
     try {
       const validationResult = registerSchema.safeParse(req.body);
@@ -416,6 +557,7 @@ router.post(
 
           resourceType: "REGISTRATION",
         });
+
         return res.status(400).json({
           success: false,
 
@@ -426,14 +568,14 @@ router.post(
       }
 
       /*
-       * Hash before entering the transaction so the transaction
-       * does not remain open during expensive bcrypt work.
+       * Expensive bcrypt work happens before
+       * entering the database transaction.
        */
       const passwordHash = await bcrypt.hash(password, 12);
 
       const currentTime = new Date();
 
-      let developmentToken = null;
+      let developmentCode = null;
 
       try {
         const result = await runSerializableTransactionWithRetry(
@@ -464,7 +606,8 @@ router.post(
                 password: passwordHash,
 
                 /*
-                 * Never accept role from the browser.
+                 * Never trust the
+                 * browser to choose role.
                  */
                 role: "CUSTOMER",
 
@@ -476,10 +619,12 @@ router.post(
               },
             });
 
-            const rawToken = await createVerificationTokenRecord({
+            const rawCode = await createVerificationCodeRecord({
               transaction,
 
               userId: user.id,
+
+              email,
 
               requestIp: req.ip,
 
@@ -508,19 +653,65 @@ router.post(
 
             return {
               created: true,
-
-              rawToken,
+              userId: user.id,
+              rawCode,
             };
           },
         );
 
-        if (result.created && EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN) {
-          developmentToken = result.rawToken;
+        if (result.created) {
+          /*
+           * Send the OTP only after the database transaction commits.
+           *
+           * Email is an external network operation and should not keep a
+           * serializable database transaction open.
+           */
+          try {
+            await sendVerificationEmail({
+              to: email,
+              code: result.rawCode,
+              expiresInMinutes: EMAIL_VERIFICATION_MINUTES,
+            });
+          } catch (emailError) {
+            /*
+             * Keep the public registration response generic.
+             *
+             * The customer can safely request another code later while the
+             * delivery failure is recorded internally.
+             */
+            console.error("Verification-email delivery failed:", {
+              requestId: req.id,
+              name: emailError.name,
+              message: emailError.message,
+            });
+
+            await recordSecurityAuditEvent({
+              req,
+              eventType: "EMAIL_VERIFICATION_DELIVERY_FAILED",
+              outcome: "FAILURE",
+              userId: result.userId,
+              actorRole: "CUSTOMER",
+              identifier: email,
+              resourceType: "USER",
+              resourceId: result.userId,
+            });
+          }
+
+          /*
+           * DEVELOPMENT ONLY.
+           *
+           * Real delivery now uses the shared email service. This preview is
+           * retained only for local testing and is rejected in production by
+           * auth.config.js.
+           */
+          if (EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN) {
+            developmentCode = result.rawCode;
+          }
         }
       } catch (error) {
         /*
-         * A simultaneous request may win the unique-email race.
-         * Return the same generic response instead of exposing it.
+         * Protect against simultaneous
+         * duplicate-email requests.
          */
         if (error?.code !== "P2002") {
           throw error;
@@ -531,10 +722,10 @@ router.post(
         ...GENERIC_REGISTRATION_RESPONSE,
       };
 
-      if (EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN && developmentToken) {
+      if (EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN && developmentCode) {
         response.developmentOnly = true;
 
-        response.developmentVerificationToken = developmentToken;
+        response.developmentVerificationCode = developmentCode;
 
         response.expiresInMinutes = EMAIL_VERIFICATION_MINUTES;
       }
@@ -543,11 +734,8 @@ router.post(
     } catch (error) {
       console.error("Registration error:", {
         requestId: req.id,
-
         name: error.name,
-
         code: error.code,
-
         message: error.message,
       });
 
@@ -564,15 +752,24 @@ router.post(
 |--------------------------------------------------------------------------
 | POST /api/auth/verify-email
 |--------------------------------------------------------------------------
+|
+| Request:
+|
+| {
+|   "email": "customer@example.com",
+|   "code": "K7M4Q2P9"
+| }
 */
 
 router.post(
   "/verify-email",
+
   requireTrustedOrigin,
   verificationIpLimiter,
+
   async (req, res) => {
     try {
-      const validationResult = verificationTokenSchema.safeParse(req.body);
+      const validationResult = verificationCodeSchema.safeParse(req.body);
 
       if (!validationResult.success) {
         return res.status(400).json({
@@ -584,45 +781,212 @@ router.post(
         });
       }
 
-      const { token } = validationResult.data;
-
-      const tokenHash = hashVerificationToken(token);
+      const { email, code } = validationResult.data;
 
       const currentTime = new Date();
 
-      await runSerializableTransactionWithRetry(async (transaction) => {
-        const verificationToken =
-          await transaction.emailVerificationToken.findUnique({
+      const verificationResult = await runSerializableTransactionWithRetry(
+        async (transaction) => {
+          const user = await transaction.user.findUnique({
             where: {
-              tokenHash,
+              email,
             },
 
             select: {
               id: true,
-              userId: true,
-              expiresAt: true,
-              usedAt: true,
+              emailVerifiedAt: true,
             },
           });
 
-        if (
-          !verificationToken ||
-          verificationToken.usedAt ||
-          verificationToken.expiresAt <= currentTime
-        ) {
-          throw new InvalidVerificationTokenError();
-        }
+          /*
+           * Do not reveal whether:
+           *
+           * - the account does not exist
+           * - it is already verified
+           * - its OTP has expired
+           *
+           * The public response remains generic.
+           */
 
-        const claimedToken =
+          if (!user || user.emailVerifiedAt) {
+            return {
+              verified: false,
+            };
+          }
+
+          const verificationRecord =
+            await transaction.emailVerificationToken.findFirst({
+              where: {
+                userId: user.id,
+
+                usedAt: null,
+
+                expiresAt: {
+                  gt: currentTime,
+                },
+
+                failedAttempts: {
+                  lt: MAX_VERIFICATION_ATTEMPTS,
+                },
+              },
+
+              orderBy: {
+                createdAt: "desc",
+              },
+
+              select: {
+                id: true,
+                tokenHash: true,
+                failedAttempts: true,
+              },
+            });
+
+          if (!verificationRecord) {
+            return {
+              verified: false,
+            };
+          }
+
+          const submittedHash = hashVerificationCode(email, code);
+
+          const codeMatches = hashesMatch(
+            submittedHash,
+            verificationRecord.tokenHash,
+          );
+
+          /*
+            |--------------------------------------------------------------------------
+            | Wrong OTP
+            |--------------------------------------------------------------------------
+            */
+
+          if (!codeMatches) {
+            const nextAttemptCount = verificationRecord.failedAttempts + 1;
+
+            const updated = await transaction.emailVerificationToken.updateMany(
+              {
+                where: {
+                  id: verificationRecord.id,
+
+                  usedAt: null,
+
+                  failedAttempts: verificationRecord.failedAttempts,
+                },
+
+                data: {
+                  failedAttempts: {
+                    increment: 1,
+                  },
+
+                  /*
+                   * The fifth incorrect attempt
+                   * kills this OTP permanently.
+                   */
+                  ...(nextAttemptCount >= MAX_VERIFICATION_ATTEMPTS
+                    ? {
+                        usedAt: currentTime,
+                      }
+                    : {}),
+                },
+              },
+            );
+
+            /*
+             * Another simultaneous request may have
+             * modified the same OTP first.
+             */
+            if (updated.count !== 1) {
+              return {
+                verified: false,
+              };
+            }
+
+            /*
+             * IMPORTANT:
+             *
+             * We RETURN instead of throwing.
+             *
+             * That allows Prisma to COMMIT the
+             * failedAttempts increment.
+             */
+            return {
+              verified: false,
+            };
+          }
+
+          /*
+            |--------------------------------------------------------------------------
+            | Correct OTP
+            |--------------------------------------------------------------------------
+            */
+
+          const claimedCode =
+            await transaction.emailVerificationToken.updateMany({
+              where: {
+                id: verificationRecord.id,
+
+                usedAt: null,
+
+                expiresAt: {
+                  gt: currentTime,
+                },
+
+                failedAttempts: {
+                  lt: MAX_VERIFICATION_ATTEMPTS,
+                },
+              },
+
+              data: {
+                usedAt: currentTime,
+              },
+            });
+
+          if (claimedCode.count !== 1) {
+            return {
+              verified: false,
+            };
+          }
+
+          await transaction.user.update({
+            where: {
+              id: user.id,
+            },
+
+            data: {
+              emailVerifiedAt: currentTime,
+            },
+          });
+
+          await writeSecurityAuditEvent({
+            database: transaction,
+
+            req,
+
+            eventType: "EMAIL_VERIFIED",
+
+            outcome: "SUCCESS",
+
+            userId: user.id,
+
+            resourceType: "USER",
+
+            resourceId: user.id,
+          });
+
+          /*
+           * Invalidate any other unused
+           * verification records.
+           */
+
           await transaction.emailVerificationToken.updateMany({
             where: {
-              id: verificationToken.id,
+              userId: user.id,
+
+              id: {
+                not: verificationRecord.id,
+              },
 
               usedAt: null,
-
-              expiresAt: {
-                gt: currentTime,
-              },
             },
 
             data: {
@@ -630,52 +994,27 @@ router.post(
             },
           });
 
-        if (claimedToken.count !== 1) {
-          throw new InvalidVerificationTokenError();
-        }
+          return {
+            verified: true,
+          };
+        },
+      );
 
-        await transaction.user.update({
-          where: {
-            id: verificationToken.userId,
-          },
+      /*
+      |--------------------------------------------------------------------------
+      | Respond AFTER transaction has committed
+      |--------------------------------------------------------------------------
+      */
 
-          data: {
-            emailVerifiedAt: currentTime,
-          },
+      if (!verificationResult.verified) {
+        return res.status(400).json({
+          success: false,
+
+          code: "INVALID_OR_EXPIRED_VERIFICATION_CODE",
+
+          message: "The verification code is invalid or expired.",
         });
-
-        await writeSecurityAuditEvent({
-          database: transaction,
-
-          req,
-
-          eventType: "EMAIL_VERIFIED",
-
-          outcome: "SUCCESS",
-
-          userId: verificationToken.userId,
-
-          resourceType: "USER",
-
-          resourceId: verificationToken.userId,
-        });
-
-        await transaction.emailVerificationToken.updateMany({
-          where: {
-            userId: verificationToken.userId,
-
-            id: {
-              not: verificationToken.id,
-            },
-
-            usedAt: null,
-          },
-
-          data: {
-            usedAt: currentTime,
-          },
-        });
-      });
+      }
 
       return res.status(200).json({
         success: true,
@@ -683,23 +1022,10 @@ router.post(
         message: "Email address verified successfully. You can now log in.",
       });
     } catch (error) {
-      if (error instanceof InvalidVerificationTokenError) {
-        return res.status(400).json({
-          success: false,
-
-          code: "INVALID_OR_EXPIRED_VERIFICATION_TOKEN",
-
-          message: "The email-verification token is invalid or expired.",
-        });
-      }
-
       console.error("Email verification error:", {
         requestId: req.id,
-
         name: error.name,
-
         code: error.code,
-
         message: error.message,
       });
 
@@ -720,9 +1046,11 @@ router.post(
 
 router.post(
   "/resend-verification",
+
   requireTrustedOrigin,
   resendIpLimiter,
   resendEmailLimiter,
+
   async (req, res) => {
     try {
       const validationResult = resendVerificationSchema.safeParse(req.body);
@@ -746,22 +1074,23 @@ router.post(
 
         select: {
           id: true,
-
           emailVerifiedAt: true,
         },
       });
 
-      let developmentToken = null;
+      let developmentCode = null;
 
       if (user && !user.emailVerifiedAt) {
         const currentTime = new Date();
 
-        const rawToken = await runSerializableTransactionWithRetry(
+        const rawCode = await runSerializableTransactionWithRetry(
           async (transaction) => {
-            const token = await createVerificationTokenRecord({
+            const code = await createVerificationCodeRecord({
               transaction,
 
               userId: user.id,
+
+              email,
 
               requestIp: req.ip,
 
@@ -784,12 +1113,36 @@ router.post(
               resourceId: user.id,
             });
 
-            return token;
+            return code;
           },
         );
 
+        try {
+          await sendVerificationEmail({
+            to: email,
+            code: rawCode,
+            expiresInMinutes: EMAIL_VERIFICATION_MINUTES,
+          });
+        } catch (emailError) {
+          console.error("Verification-email resend delivery failed:", {
+            requestId: req.id,
+            name: emailError.name,
+            message: emailError.message,
+          });
+
+          await recordSecurityAuditEvent({
+            req,
+            eventType: "EMAIL_VERIFICATION_DELIVERY_FAILED",
+            outcome: "FAILURE",
+            userId: user.id,
+            identifier: email,
+            resourceType: "USER",
+            resourceId: user.id,
+          });
+        }
+
         if (EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN) {
-          developmentToken = rawToken;
+          developmentCode = rawCode;
         }
       }
 
@@ -797,10 +1150,10 @@ router.post(
         ...GENERIC_RESEND_RESPONSE,
       };
 
-      if (EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN && developmentToken) {
+      if (EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN && developmentCode) {
         response.developmentOnly = true;
 
-        response.developmentVerificationToken = developmentToken;
+        response.developmentVerificationCode = developmentCode;
 
         response.expiresInMinutes = EMAIL_VERIFICATION_MINUTES;
       }
@@ -809,11 +1162,8 @@ router.post(
     } catch (error) {
       console.error("Resend verification error:", {
         requestId: req.id,
-
         name: error.name,
-
         code: error.code,
-
         message: error.message,
       });
 

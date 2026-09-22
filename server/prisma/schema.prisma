@@ -40,8 +40,13 @@ enum CallbackProcessingStatus {
 enum SecurityAuditOutcome {
   SUCCESS
   FAILURE
-  DENIEDs
+  DENIED
   ERROR
+}
+
+enum AuthSessionType {
+  CUSTOMER
+  ADMIN
 }
 
 model AuthSession {
@@ -59,6 +64,8 @@ model AuthSession {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  sessionType AuthSessionType @default(CUSTOMER)
 
   @@index([userId, revokedAt, expiresAt])
   @@index([expiresAt])
@@ -94,6 +101,8 @@ model EmailVerificationToken {
   expiresAt DateTime
   usedAt    DateTime?
 
+  failedAttempts Int @default(0)
+
   requestedIpHash String? @db.VarChar(64)
 
   createdAt DateTime @default(now())
@@ -117,6 +126,8 @@ model User {
   passwordResetTokens     PasswordResetToken[]
   emailVerificationTokens EmailVerificationToken[]
   securityAuditLogs       SecurityAuditLog[]
+
+  cart Cart?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -146,11 +157,42 @@ model Product {
   category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
 
   orderItems OrderItem[]
+  cartItems  CartItem[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([categoryId])
+}
+
+model Cart {
+  id String @id @default(cuid())
+
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  items CartItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model CartItem {
+  id String @id @default(cuid())
+
+  cartId String
+  cart   Cart   @relation(fields: [cartId], references: [id], onDelete: Cascade)
+
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  quantity Int @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([cartId, productId])
+  @@index([productId])
 }
 
 model Order {

@@ -1,7 +1,7 @@
 import express from "express";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { protect, adminOnly } from "../middleware/auth.middleware.js";
-import { requireTrustedOrigin } from "../middleware/csrf.middleware.js";
+import { protectAdmin } from "../middleware/auth.middleware.js";
+import { requireCsrf } from "../middleware/csrf.middleware.js";
 import {
   getMpesaAccessToken,
   initiateMpesaStkPush,
@@ -103,27 +103,42 @@ const mpesaCallbackLimiter = rateLimit({
 const ACTIVE_PAYMENT_ATTEMPT_WINDOW_MS = 5 * 60 * 1000;
 
 class HttpError extends Error {
-  constructor(statusCode, message) {
+  constructor(statusCode, code, message) {
     super(message);
 
     this.name = "HttpError";
     this.statusCode = statusCode;
+    this.code = code;
   }
 }
+const reservePaymentAttempt = async (orderId, userId) => {
+  const currentTime = new Date();
 
-const reservePaymentAttempt = async (orderId) => {
   const activeAttemptCutoff = new Date(
-    Date.now() - ACTIVE_PAYMENT_ATTEMPT_WINDOW_MS,
+    currentTime.getTime() - ACTIVE_PAYMENT_ATTEMPT_WINDOW_MS,
   );
 
   return prisma.$transaction(
     async (transaction) => {
       /*
-       * Retrieve the order inside the transaction.
-       */
-      const order = await transaction.order.findUnique({
+      |--------------------------------------------------------------------------
+      | Retrieve customer's OWN order
+      |--------------------------------------------------------------------------
+      |
+      | Both conditions must match:
+      |
+      | order ID
+      | authenticated user ID
+      |
+      | An order belonging to another customer therefore looks exactly
+      | like an order that does not exist.
+      */
+
+      const order = await transaction.order.findFirst({
         where: {
           id: orderId,
+
+          userId,
         },
 
         include: {
@@ -132,31 +147,62 @@ const reservePaymentAttempt = async (orderId) => {
       });
 
       if (!order) {
-        throw new HttpError(404, "Order not found.");
+        throw new HttpError(404, "ORDER_NOT_FOUND", "Order not found.");
       }
 
       /*
-       * Only pending orders may begin a payment attempt.
-       */
+      |--------------------------------------------------------------------------
+      | Already paid
+      |--------------------------------------------------------------------------
+      */
+
+      if (order.status === "PAID" || order.payment?.status === "SUCCESS") {
+        throw new HttpError(
+          409,
+          "ORDER_ALREADY_PAID",
+          "This order has already been paid.",
+        );
+      }
+
+      /*
+      |--------------------------------------------------------------------------
+      | Order must still be pending
+      |--------------------------------------------------------------------------
+      */
+
       if (order.status !== "PENDING") {
         throw new HttpError(
           409,
-
+          "ORDER_NOT_PAYABLE",
           `Payment cannot be initiated for an order with status ${order.status}.`,
         );
       }
 
       /*
-       * A successful summary payment means this order must never
-       * be charged again.
-       */
-      if (order.payment?.status === "SUCCESS") {
-        throw new HttpError(409, "This order has already been paid.");
+      |--------------------------------------------------------------------------
+      | Payment window
+      |--------------------------------------------------------------------------
+      |
+      | Do not depend solely on the background expiry worker.
+      |
+      | There may be a small period where expiresAt has passed but the
+      | expiry worker has not yet changed PENDING → EXPIRED.
+      */
+
+      if (!order.expiresAt || order.expiresAt <= currentTime) {
+        throw new HttpError(
+          409,
+          "ORDER_EXPIRED",
+          "This order's payment window has expired.",
+        );
       }
 
       /*
-       * Any PENDING or VERIFYING attempt blocks another request.
-       */
+      |--------------------------------------------------------------------------
+      | Existing unresolved attempt
+      |--------------------------------------------------------------------------
+      */
+
       const activeAttempt = await transaction.paymentAttempt.findFirst({
         where: {
           orderId: order.id,
@@ -174,24 +220,35 @@ const reservePaymentAttempt = async (orderId) => {
       if (activeAttempt) {
         const attemptIsRecent = activeAttempt.createdAt >= activeAttemptCutoff;
 
+        if (attemptIsRecent) {
+          throw new HttpError(
+            409,
+            "PAYMENT_ATTEMPT_ACTIVE",
+            "A recent payment request is still being processed for this order.",
+          );
+        }
+
         throw new HttpError(
           409,
-
-          attemptIsRecent
-            ? "A recent payment request is still being processed for this order."
-            : "A previous payment request still requires verification. Do not retry yet.",
+          "PAYMENT_VERIFICATION_REQUIRED",
+          "A previous payment request still requires verification. Do not retry yet.",
         );
       }
 
       /*
-       * The amount comes from PostgreSQL, never from the browser.
-       */
+      |--------------------------------------------------------------------------
+      | Authoritative amount
+      |--------------------------------------------------------------------------
+      |
+      | The browser NEVER supplies the amount.
+      */
+
       const amount = Number(order.totalAmount);
 
       if (!Number.isSafeInteger(amount) || amount < 1) {
         throw new HttpError(
           400,
-
+          "INVALID_MPESA_AMOUNT",
           "The order amount must be a positive whole number for M-Pesa.",
         );
       }
@@ -199,13 +256,19 @@ const reservePaymentAttempt = async (orderId) => {
       const accountReference = `ORD${order.id.slice(-8).toUpperCase()}`;
 
       /*
-       * Create the attempt before contacting Safaricom.
-       */
+      |--------------------------------------------------------------------------
+      | Reserve payment attempt BEFORE Safaricom request
+      |--------------------------------------------------------------------------
+      */
+
       const paymentAttempt = await transaction.paymentAttempt.create({
         data: {
           orderId: order.id,
+
           method: "MPESA",
+
           status: "PENDING",
+
           amount: order.totalAmount,
 
           phoneNumber: order.customerPhone,
@@ -217,9 +280,11 @@ const reservePaymentAttempt = async (orderId) => {
       });
 
       /*
-       * Payment contains the order's current payment summary.
-       * PaymentAttempt contains the complete attempt history.
-       */
+      |--------------------------------------------------------------------------
+      | Current payment summary
+      |--------------------------------------------------------------------------
+      */
+
       await transaction.payment.upsert({
         where: {
           orderId: order.id,
@@ -227,26 +292,35 @@ const reservePaymentAttempt = async (orderId) => {
 
         update: {
           method: "MPESA",
+
           status: "PENDING",
+
           amount: order.totalAmount,
 
           phoneNumber: order.customerPhone,
 
           merchantRequestId: null,
+
           checkoutRequestId: null,
+
           mpesaReceiptNumber: null,
+
           resultCode: null,
 
           resultDescription: "A new payment attempt has been reserved.",
 
           verifiedAt: null,
+
           paidAt: null,
         },
 
         create: {
           orderId: order.id,
+
           method: "MPESA",
+
           status: "PENDING",
+
           amount: order.totalAmount,
 
           phoneNumber: order.customerPhone,
@@ -268,7 +342,6 @@ const reservePaymentAttempt = async (orderId) => {
     },
   );
 };
-
 /*
 |--------------------------------------------------------------------------
 | Callback validation
@@ -620,7 +693,7 @@ const runSerializableTransactionWithRetry = async (
 */
 
 if (process.env.NODE_ENV !== "production") {
-  router.get("/token-test", protect, adminOnly, async (req, res) => {
+  router.get("/token-test", protectAdmin, async (req, res) => {
     try {
       const { accessToken, expiresIn } = await getMpesaAccessToken();
 
@@ -660,7 +733,8 @@ if (process.env.NODE_ENV !== "production") {
 
 router.post(
   "/stk-push",
-  requireTrustedOrigin,
+  protectAdmin,
+  requireCsrf,
   stkPushLimiter,
   async (req, res) => {
     try {
@@ -686,7 +760,7 @@ router.post(
        * Reserve the attempt before contacting Safaricom.
        */
       const { order, paymentAttempt, amount, accountReference } =
-        await reservePaymentAttempt(orderId);
+        await reservePaymentAttempt(orderId, req.user.id);
 
       let stkResponse;
 
@@ -868,13 +942,16 @@ router.post(
         return res.status(error.statusCode).json({
           success: false,
 
+          code: error.code,
+
           message: error.message,
         });
       }
-
       if (error?.code === "P2034") {
         return res.status(409).json({
           success: false,
+
+          code: "PAYMENT_CONCURRENCY_CONFLICT",
 
           message:
             "Another payment request is already being processed for this order.",

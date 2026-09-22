@@ -1,27 +1,34 @@
 import express from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+
 import { createHash, randomUUID } from "node:crypto";
+
 import { rateLimit, ipKeyGenerator } from "express-rate-limit";
+
 import { z } from "zod";
 
 import prisma from "../config/prisma.js";
-import { protect, adminOnly } from "../middleware/auth.middleware.js";
+
+import { protectCustomer } from "../middleware/auth.middleware.js";
+
 import {
   createCsrfToken,
   requireCsrf,
   requireTrustedOrigin,
 } from "../middleware/csrf.middleware.js";
+
 import {
-  AUTH_COOKIE_NAME,
   AUTH_MAX_ACTIVE_SESSIONS,
   AUTH_SESSION_SECONDS,
+  AUTH_SESSION_TYPES,
+  CUSTOMER_AUTH_COOKIE_NAME,
   JWT_ALGORITHM,
   JWT_AUDIENCE,
   JWT_ISSUER,
   JWT_SECRET,
-  getAuthCookieClearOptions,
-  getAuthCookieOptions,
+  getCustomerAuthCookieClearOptions,
+  getCustomerAuthCookieOptions,
 } from "../config/auth.config.js";
 
 import { recordSecurityAuditEvent } from "../services/security-audit.service.js";
@@ -67,14 +74,18 @@ const formatValidationErrors = (issues) =>
 
 const loginIpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
+
   max: 20,
+
   standardHeaders: true,
   legacyHeaders: false,
+
   skipSuccessfulRequests: true,
 
   handler: (req, res) => {
     return res.status(429).json({
       success: false,
+
       message: "Too many login attempts. Please wait before trying again.",
     });
   },
@@ -93,46 +104,56 @@ const getLoginAttemptKey = (req) => {
 
 const loginAccountLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
+
   max: 5,
+
   standardHeaders: true,
   legacyHeaders: false,
+
   skipSuccessfulRequests: true,
+
   keyGenerator: getLoginAttemptKey,
 
   handler: (req, res) => {
     return res.status(429).json({
       success: false,
+
       message: "Too many login attempts. Please wait before trying again.",
     });
   },
 });
 
 /*
- * Unknown accounts still perform a bcrypt comparison.
- * This reduces account-enumeration timing differences.
+ * Unknown accounts still perform bcrypt work.
  */
 const DUMMY_PASSWORD_HASH = bcrypt.hashSync("not-a-real-user-password", 10);
 
 /*
 |--------------------------------------------------------------------------
-| JWT creation
+| Customer JWT creation
 |--------------------------------------------------------------------------
-|
-| The JWT ID must be the same ID stored in AuthSession.
 */
 
-const createToken = (userId, jwtId) => {
+const createCustomerToken = (userId, jwtId) => {
   return jwt.sign(
     {
       tokenType: "access",
+
+      sessionType: AUTH_SESSION_TYPES.CUSTOMER,
     },
+
     JWT_SECRET,
+
     {
       algorithm: JWT_ALGORITHM,
+
       subject: userId,
+
       issuer: JWT_ISSUER,
       audience: JWT_AUDIENCE,
+
       expiresIn: AUTH_SESSION_SECONDS,
+
       jwtid: jwtId,
     },
   );
@@ -140,11 +161,18 @@ const createToken = (userId, jwtId) => {
 
 /*
 |--------------------------------------------------------------------------
-| Server-side session creation
+| Customer session creation
 |--------------------------------------------------------------------------
+|
+| The active-session limit is scoped by:
+|
+| userId + CUSTOMER
+|
+| ADMIN sessions therefore do not count against the customer's session
+| allowance.
 */
 
-const createAuthSession = async (userId) => {
+const createCustomerAuthSession = async (userId) => {
   const currentTime = new Date();
 
   const expiresAt = new Date(
@@ -158,6 +186,9 @@ const createAuthSession = async (userId) => {
       const activeSessions = await transaction.authSession.findMany({
         where: {
           userId,
+
+          sessionType: AUTH_SESSION_TYPES.CUSTOMER,
+
           revokedAt: null,
 
           expiresAt: {
@@ -174,12 +205,9 @@ const createAuthSession = async (userId) => {
         },
       });
 
-      /*
-       * Revoke the oldest session or sessions when the
-       * account has reached its active-session limit.
-       */
       const sessionsToRevoke = Math.max(
         0,
+
         activeSessions.length - AUTH_MAX_ACTIVE_SESSIONS + 1,
       );
 
@@ -193,6 +221,9 @@ const createAuthSession = async (userId) => {
             id: {
               in: sessionIds,
             },
+
+            sessionType: AUTH_SESSION_TYPES.CUSTOMER,
+
             revokedAt: null,
           },
 
@@ -207,11 +238,16 @@ const createAuthSession = async (userId) => {
       return transaction.authSession.create({
         data: {
           userId,
+
           jwtId,
+
+          sessionType: AUTH_SESSION_TYPES.CUSTOMER,
+
           expiresAt,
         },
       });
     },
+
     {
       isolationLevel: "Serializable",
     },
@@ -228,9 +264,12 @@ const createAuthSession = async (userId) => {
 
 router.post(
   "/login",
+
   requireTrustedOrigin,
+
   loginIpLimiter,
   loginAccountLimiter,
+
   async (req, res) => {
     try {
       const validationResult = loginSchema.safeParse(req.body);
@@ -238,6 +277,7 @@ router.post(
       if (!validationResult.success) {
         return res.status(400).json({
           success: false,
+
           message: "Invalid login information.",
 
           errors: formatValidationErrors(validationResult.error.issues),
@@ -304,15 +344,9 @@ router.post(
         });
       }
 
-      /*
-       * Create the database session first.
-       */
-      const session = await createAuthSession(user.id);
+      const session = await createCustomerAuthSession(user.id);
 
-      /*
-       * The token uses the same JWT ID stored in AuthSession.
-       */
-      const token = createToken(user.id, session.jwtId);
+      const token = createCustomerToken(user.id, session.jwtId);
 
       const csrfToken = createCsrfToken({
         sessionId: session.id,
@@ -322,7 +356,13 @@ router.post(
         jwtId: session.jwtId,
       });
 
-      res.cookie(AUTH_COOKIE_NAME, token, getAuthCookieOptions());
+      res.cookie(
+        CUSTOMER_AUTH_COOKIE_NAME,
+
+        token,
+
+        getCustomerAuthCookieOptions(),
+      );
 
       await recordSecurityAuditEvent({
         req,
@@ -340,9 +380,15 @@ router.post(
         resourceType: "AUTH_SESSION",
 
         resourceId: session.id,
+
+        metadata: {
+          sessionType: AUTH_SESSION_TYPES.CUSTOMER,
+        },
       });
+
       return res.status(200).json({
         success: true,
+
         message: "Login successful.",
 
         session: {
@@ -355,21 +401,30 @@ router.post(
 
         user: {
           id: user.id,
+
           fullName: user.fullName,
+
           email: user.email,
+
           phone: user.phone,
+
           role: user.role,
         },
       });
     } catch (error) {
-      console.error("Secure login error:", {
-        name: error.name,
-        code: error.code,
-        message: error.message,
+      console.error("Secure customer login error:", {
+        requestId: req.id,
+
+        name: error?.name,
+
+        code: error?.code,
+
+        message: error?.message,
       });
 
       return res.status(500).json({
         success: false,
+
         message: "Login could not be completed safely.",
       });
     }
@@ -380,12 +435,9 @@ router.post(
 |--------------------------------------------------------------------------
 | GET /api/auth/csrf-token
 |--------------------------------------------------------------------------
-|
-| Allows the frontend to retrieve its session-bound CSRF token
-| after refreshing the page.
 */
 
-router.get("/csrf-token", protect, (req, res) => {
+router.get("/csrf-token", protectCustomer, (req, res) => {
   try {
     const csrfToken = createCsrfToken({
       sessionId: req.auth.sessionId,
@@ -399,16 +451,21 @@ router.get("/csrf-token", protect, (req, res) => {
 
     return res.status(200).json({
       success: true,
+
       csrfToken,
     });
   } catch (error) {
-    console.error("CSRF token generation error:", {
-      name: error.name,
-      message: error.message,
+    console.error("Customer CSRF token generation error:", {
+      requestId: req.id,
+
+      name: error?.name,
+
+      message: error?.message,
     });
 
     return res.status(500).json({
       success: false,
+
       message: "The CSRF token could not be generated safely.",
     });
   }
@@ -418,80 +475,96 @@ router.get("/csrf-token", protect, (req, res) => {
 |--------------------------------------------------------------------------
 | POST /api/auth/logout
 |--------------------------------------------------------------------------
-|
-| Logout requires:
-| - A valid authenticated session
-| - A valid session-bound CSRF token
-| - Database session revocation
 */
 
-router.post("/logout", protect, requireCsrf, async (req, res) => {
-  try {
-    const revokedAt = new Date();
+router.post(
+  "/logout",
 
-    await prisma.authSession.updateMany({
-      where: {
-        id: req.auth.sessionId,
+  protectCustomer,
+
+  requireCsrf,
+
+  async (req, res) => {
+    try {
+      const revokedAt = new Date();
+
+      await prisma.authSession.updateMany({
+        where: {
+          id: req.auth.sessionId,
+
+          userId: req.user.id,
+
+          sessionType: AUTH_SESSION_TYPES.CUSTOMER,
+
+          revokedAt: null,
+        },
+
+        data: {
+          revokedAt,
+
+          revocationReason: "USER_LOGOUT",
+        },
+      });
+
+      await recordSecurityAuditEvent({
+        req,
+
+        eventType: "LOGOUT_SUCCESS",
+
+        outcome: "SUCCESS",
 
         userId: req.user.id,
 
-        revokedAt: null,
-      },
+        actorRole: req.user.role,
 
-      data: {
-        revokedAt,
+        resourceType: "AUTH_SESSION",
 
-        revocationReason: "USER_LOGOUT",
-      },
-    });
+        resourceId: req.auth.sessionId,
 
-    await recordSecurityAuditEvent({
-      req,
+        metadata: {
+          reason: "USER_LOGOUT",
 
-      eventType: "LOGOUT_SUCCESS",
+          sessionType: AUTH_SESSION_TYPES.CUSTOMER,
+        },
+      });
 
-      outcome: "SUCCESS",
+      res.clearCookie(
+        CUSTOMER_AUTH_COOKIE_NAME,
 
-      userId: req.user.id,
+        getCustomerAuthCookieClearOptions(),
+      );
 
-      actorRole: req.user.role,
+      return res.status(200).json({
+        success: true,
 
-      resourceType: "AUTH_SESSION",
+        message: "Logout successful.",
+      });
+    } catch (error) {
+      res.clearCookie(
+        CUSTOMER_AUTH_COOKIE_NAME,
 
-      resourceId: req.auth.sessionId,
+        getCustomerAuthCookieClearOptions(),
+      );
 
-      metadata: {
-        reason: "USER_LOGOUT",
-      },
-    });
+      console.error("Customer session revocation error:", {
+        requestId: req.id,
 
-    res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
+        name: error?.name,
 
-    return res.status(200).json({
-      success: true,
-      message: "Logout successful.",
-    });
-  } catch (error) {
-    /*
-     * Clear the browser cookie even if database revocation fails,
-     * but do not claim that server-side revocation succeeded.
-     */
-    res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
+        code: error?.code,
 
-    console.error("Session revocation error:", {
-      name: error.name,
-      code: error.code,
-      message: error.message,
-    });
+        message: error?.message,
+      });
 
-    return res.status(503).json({
-      success: false,
+      return res.status(503).json({
+        success: false,
 
-      message:
-        "Your local session was cleared, but server-side logout could not be confirmed.",
-    });
-  }
-});
+        message:
+          "Your local session was cleared, but server-side logout could not be confirmed.",
+      });
+    }
+  },
+);
 
 /*
 |--------------------------------------------------------------------------
@@ -499,28 +572,15 @@ router.post("/logout", protect, requireCsrf, async (req, res) => {
 |--------------------------------------------------------------------------
 */
 
-router.get("/me", protect, (req, res) => {
+router.get("/me", protectCustomer, (req, res) => {
   return res.status(200).json({
     success: true,
+
     user: req.user,
 
     session: {
       expiresAt: req.auth.expiresAt,
     },
-  });
-});
-
-/*
-|--------------------------------------------------------------------------
-| GET /api/auth/admin-check
-|--------------------------------------------------------------------------
-*/
-
-router.get("/admin-check", protect, adminOnly, (req, res) => {
-  return res.status(200).json({
-    success: true,
-    message: "Admin access granted.",
-    user: req.user,
   });
 });
 

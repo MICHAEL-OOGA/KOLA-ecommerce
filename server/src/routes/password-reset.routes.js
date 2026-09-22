@@ -24,6 +24,8 @@ import {
   writeSecurityAuditEvent,
 } from "../services/security-audit.service.js";
 
+import { sendPasswordResetEmail } from "../services/email.service.js";
+
 const router = express.Router();
 
 /*
@@ -70,14 +72,12 @@ const resetPasswordSchema = z
   .strict()
   .refine((data) => data.password === data.confirmPassword, {
     path: ["confirmPassword"],
-
     message: "Password confirmation does not match.",
   });
 
 const formatValidationErrors = (issues) =>
   issues.map((issue) => ({
     field: issue.path.join("."),
-
     message: issue.message,
   }));
 
@@ -89,18 +89,14 @@ const formatValidationErrors = (issues) =>
 
 const forgotPasswordIpLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
-
   max: 10,
-
   standardHeaders: true,
   legacyHeaders: false,
-
   keyGenerator: (req) => ipKeyGenerator(req.ip),
 
   handler: (req, res) => {
     return res.status(429).json({
       success: false,
-
       message: "Too many password-reset requests. Please try again later.",
     });
   },
@@ -117,18 +113,14 @@ const getEmailRateLimitKey = (req) => {
 
 const forgotPasswordEmailLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
-
   max: 3,
-
   standardHeaders: true,
   legacyHeaders: false,
-
   keyGenerator: getEmailRateLimitKey,
 
   handler: (req, res) => {
     return res.status(429).json({
       success: false,
-
       message: "Too many password-reset requests. Please try again later.",
     });
   },
@@ -136,18 +128,14 @@ const forgotPasswordEmailLimiter = rateLimit({
 
 const resetPasswordIpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-
   max: 10,
-
   standardHeaders: true,
   legacyHeaders: false,
-
   keyGenerator: (req) => ipKeyGenerator(req.ip),
 
   handler: (req, res) => {
     return res.status(429).json({
       success: false,
-
       message: "Too many password-reset attempts. Please try again later.",
     });
   },
@@ -164,18 +152,14 @@ const getResetTokenRateLimitKey = (req) => {
 
 const resetPasswordTokenLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-
   max: 5,
-
   standardHeaders: true,
   legacyHeaders: false,
-
   keyGenerator: getResetTokenRateLimitKey,
 
   handler: (req, res) => {
     return res.status(429).json({
       success: false,
-
       message: "Too many password-reset attempts. Please try again later.",
     });
   },
@@ -204,6 +188,40 @@ const hashRequestIp = (requestIp) => {
   }
 
   return createSensitiveHash("password-reset-ip", requestIp);
+};
+
+const createPasswordResetUrl = (rawToken) => {
+  const configuredUrl = process.env.PASSWORD_RESET_CLIENT_URL?.trim();
+
+  if (!configuredUrl) {
+    throw new Error("PASSWORD_RESET_CLIENT_URL is required.");
+  }
+
+  let resetUrl;
+
+  try {
+    resetUrl = new URL(configuredUrl);
+  } catch {
+    throw new Error("PASSWORD_RESET_CLIENT_URL must be a valid URL.");
+  }
+
+  if (!["http:", "https:"].includes(resetUrl.protocol)) {
+    throw new Error(
+      "PASSWORD_RESET_CLIENT_URL must use the HTTP or HTTPS protocol.",
+    );
+  }
+
+  if (process.env.NODE_ENV === "production" && resetUrl.protocol !== "https:") {
+    throw new Error("PASSWORD_RESET_CLIENT_URL must use HTTPS in production.");
+  }
+
+  resetUrl.pathname = "/reset-password";
+  resetUrl.search = "";
+  resetUrl.hash = new URLSearchParams({
+    token: rawToken,
+  }).toString();
+
+  return resetUrl.toString();
 };
 
 /*
@@ -272,6 +290,7 @@ router.post(
   requireTrustedOrigin,
   forgotPasswordIpLimiter,
   forgotPasswordEmailLimiter,
+
   async (req, res) => {
     try {
       const validationResult = forgotPasswordSchema.safeParse(req.body);
@@ -288,9 +307,6 @@ router.post(
 
       const { email } = validationResult.data;
 
-      /*
-       * Perform the same bcrypt operation for every request.
-       */
       await bcrypt.compare(
         "password-reset-timing-check",
         DUMMY_RESET_PASSWORD_HASH,
@@ -303,6 +319,7 @@ router.post(
 
         select: {
           id: true,
+          email: true,
         },
       });
 
@@ -321,12 +338,11 @@ router.post(
 
         await runSerializableTransactionWithRetry(async (transaction) => {
           /*
-           * Invalidate all previous unused reset tokens.
+           * Issuing a new token invalidates every previous unused token.
            */
           await transaction.passwordResetToken.updateMany({
             where: {
               userId: user.id,
-
               usedAt: null,
             },
 
@@ -338,28 +354,45 @@ router.post(
           await transaction.passwordResetToken.create({
             data: {
               userId: user.id,
-
               tokenHash,
-
               expiresAt,
-
               requestedIpHash: hashRequestIp(req.ip),
             },
           });
         });
 
-        /*
-         * Local Postman testing only.
-         * Production startup rejects this setting.
-         */
+        const resetUrl = createPasswordResetUrl(rawToken);
+
+        try {
+          await sendPasswordResetEmail({
+            to: user.email,
+            resetUrl,
+            expiresInMinutes: PASSWORD_RESET_MINUTES,
+          });
+        } catch (emailError) {
+          /*
+           * Keep the public response generic so delivery problems cannot be
+           * used to determine whether an account exists.
+           */
+          console.error("Password-reset email delivery failed:", {
+            requestId: req.id,
+            name: emailError.name,
+            message: emailError.message,
+          });
+
+          await recordSecurityAuditEvent({
+            req,
+            eventType: "PASSWORD_RESET_EMAIL_FAILED",
+            outcome: "FAILURE",
+            userId: user.id,
+            identifier: email,
+            resourceType: "PASSWORD_RESET",
+          });
+        }
+
         if (PASSWORD_RESET_DEV_EXPOSE_TOKEN) {
           developmentResetToken = rawToken;
         }
-
-        /*
-         * Email delivery will replace the development-token preview
-         * in the next substep.
-         */
       }
 
       const response = {
@@ -368,21 +401,15 @@ router.post(
 
       if (PASSWORD_RESET_DEV_EXPOSE_TOKEN && developmentResetToken) {
         response.developmentOnly = true;
-
         response.developmentResetToken = developmentResetToken;
-
         response.expiresInMinutes = PASSWORD_RESET_MINUTES;
       }
 
       await recordSecurityAuditEvent({
         req,
-
         eventType: "PASSWORD_RESET_REQUESTED",
-
         outcome: "SUCCESS",
-
         identifier: email,
-
         resourceType: "PASSWORD_RESET",
       });
 
@@ -390,17 +417,13 @@ router.post(
     } catch (error) {
       console.error("Forgot-password error:", {
         requestId: req.id,
-
         name: error.name,
-
         code: error.code,
-
         message: error.message,
       });
 
       return res.status(500).json({
         success: false,
-
         message: "The password-reset request could not be processed safely.",
       });
     }
@@ -418,6 +441,7 @@ router.post(
   requireTrustedOrigin,
   resetPasswordIpLimiter,
   resetPasswordTokenLimiter,
+
   async (req, res) => {
     try {
       const validationResult = resetPasswordSchema.safeParse(req.body);
@@ -438,7 +462,6 @@ router.post(
 
       /*
        * Hash before opening the database transaction.
-       * This avoids keeping the transaction open during bcrypt work.
        */
       const passwordHash = await bcrypt.hash(password, 12);
 
@@ -467,13 +490,12 @@ router.post(
         }
 
         /*
-         * Atomically claim the token.
-         * Only one simultaneous request may change usedAt from null.
+         * Atomically claim the token. Only one simultaneous reset request may
+         * change usedAt from null.
          */
         const claimedToken = await transaction.passwordResetToken.updateMany({
           where: {
             id: resetToken.id,
-
             usedAt: null,
 
             expiresAt: {
@@ -501,25 +523,22 @@ router.post(
         });
 
         /*
-         * Revoke every active login session.
+         * A password reset invalidates every active authenticated session.
          */
         await transaction.authSession.updateMany({
           where: {
             userId: resetToken.userId,
-
             revokedAt: null,
           },
 
           data: {
             revokedAt: currentTime,
-
             revocationReason: "PASSWORD_RESET",
           },
         });
 
         /*
-         * Invalidate any other unused reset token belonging to
-         * the same account.
+         * Invalidate every other unused reset token for this account.
          */
         await transaction.passwordResetToken.updateMany({
           where: {
@@ -536,30 +555,30 @@ router.post(
             usedAt: currentTime,
           },
         });
-      });
 
-      await writeSecurityAuditEvent({
-        database: transaction,
+        /*
+         * Keep the password update, session revocation and success audit event
+         * inside the same serializable transaction.
+         *
+         * This also fixes the previous out-of-scope transaction/resetToken bug.
+         */
+        await writeSecurityAuditEvent({
+          database: transaction,
+          req,
+          eventType: "PASSWORD_RESET_SUCCESS",
+          outcome: "SUCCESS",
+          userId: resetToken.userId,
+          resourceType: "USER",
+          resourceId: resetToken.userId,
 
-        req,
-
-        eventType: "PASSWORD_RESET_SUCCESS",
-
-        outcome: "SUCCESS",
-
-        userId: resetToken.userId,
-
-        resourceType: "USER",
-
-        resourceId: resetToken.userId,
-
-        metadata: {
-          activeSessionsRevoked: true,
-        },
+          metadata: {
+            activeSessionsRevoked: true,
+          },
+        });
       });
 
       /*
-       * Remove any authentication cookie currently held by the browser.
+       * Remove any authentication cookie currently held by this browser.
        */
       res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
 
@@ -573,35 +592,27 @@ router.post(
       if (error instanceof InvalidResetTokenError) {
         await recordSecurityAuditEvent({
           req,
-
           eventType: "PASSWORD_RESET_FAILED",
-
           outcome: "FAILURE",
-
           resourceType: "PASSWORD_RESET",
         });
+
         return res.status(400).json({
           success: false,
-
           code: "INVALID_OR_EXPIRED_RESET_TOKEN",
-
           message: "The password-reset token is invalid or expired.",
         });
       }
 
       console.error("Reset-password error:", {
         requestId: req.id,
-
         name: error.name,
-
         code: error.code,
-
         message: error.message,
       });
 
       return res.status(500).json({
         success: false,
-
         message: "The password could not be reset safely.",
       });
     }

@@ -1,0 +1,2 @@
+ALTER TYPE "SecurityAuditOutcome"
+RENAME VALUE 'DENIEDs' TO 'DENIED';

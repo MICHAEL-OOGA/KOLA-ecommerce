@@ -3,12 +3,20 @@
 | Authentication configuration
 |--------------------------------------------------------------------------
 |
-| This module centralises:
+| Centralises:
 | - JWT security settings
-| - Cookie settings
+| - Customer/admin cookie settings
 | - Session duration
 | - Password-reset settings
+| - Email-verification settings
 | - Environment validation
+|
+*/
+
+/*
+|--------------------------------------------------------------------------
+| Environment helpers
+|--------------------------------------------------------------------------
 */
 
 const readBoundedIntegerEnv = (name, fallback, minimum, maximum) => {
@@ -80,6 +88,27 @@ const readSameSiteSetting = () => {
   return value;
 };
 
+/*
+|--------------------------------------------------------------------------
+| Environment
+|--------------------------------------------------------------------------
+*/
+
+const isProduction = process.env.NODE_ENV === "production";
+
+/*
+|--------------------------------------------------------------------------
+| Secrets
+|--------------------------------------------------------------------------
+|
+| These secrets must:
+|
+| - exist
+| - contain at least 32 bytes
+| - be different from one another
+|
+*/
+
 export const JWT_SECRET = readRequiredSecret("JWT_SECRET");
 
 export const CSRF_SECRET = readRequiredSecret("CSRF_SECRET");
@@ -105,6 +134,12 @@ if (new Set(authenticationSecrets).size !== authenticationSecrets.length) {
   );
 }
 
+/*
+|--------------------------------------------------------------------------
+| JWT configuration
+|--------------------------------------------------------------------------
+*/
+
 export const JWT_ALGORITHM = "HS256";
 
 export const JWT_ISSUER =
@@ -112,6 +147,29 @@ export const JWT_ISSUER =
 
 export const JWT_AUDIENCE =
   process.env.JWT_AUDIENCE?.trim() || "mini-ecommerce-client";
+
+/*
+|--------------------------------------------------------------------------
+| Session types
+|--------------------------------------------------------------------------
+|
+| CUSTOMER and ADMIN are authentication-session purposes.
+|
+| They are deliberately separated so the storefront and admin
+| application can remain logged in independently.
+|
+*/
+
+export const AUTH_SESSION_TYPES = Object.freeze({
+  CUSTOMER: "CUSTOMER",
+  ADMIN: "ADMIN",
+});
+
+/*
+|--------------------------------------------------------------------------
+| Session lifetime
+|--------------------------------------------------------------------------
+*/
 
 export const AUTH_SESSION_MINUTES = readBoundedIntegerEnv(
   "AUTH_SESSION_MINUTES",
@@ -129,6 +187,12 @@ export const AUTH_MAX_ACTIVE_SESSIONS = readBoundedIntegerEnv(
   20,
 );
 
+/*
+|--------------------------------------------------------------------------
+| Password-reset configuration
+|--------------------------------------------------------------------------
+*/
+
 export const PASSWORD_RESET_MINUTES = readBoundedIntegerEnv(
   "PASSWORD_RESET_MINUTES",
   15,
@@ -136,22 +200,8 @@ export const PASSWORD_RESET_MINUTES = readBoundedIntegerEnv(
   60,
 );
 
-export const EMAIL_VERIFICATION_MINUTES = readBoundedIntegerEnv(
-  "EMAIL_VERIFICATION_MINUTES",
-  60,
-  10,
-  1440,
-);
-
-const isProduction = process.env.NODE_ENV === "production";
-
 export const PASSWORD_RESET_DEV_EXPOSE_TOKEN = readBooleanEnv(
   "PASSWORD_RESET_DEV_EXPOSE_TOKEN",
-  false,
-);
-
-export const EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN = readBooleanEnv(
-  "EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN",
   false,
 );
 
@@ -161,38 +211,177 @@ if (isProduction && PASSWORD_RESET_DEV_EXPOSE_TOKEN) {
   );
 }
 
+/*
+|--------------------------------------------------------------------------
+| Email-verification configuration
+|--------------------------------------------------------------------------
+*/
+
+export const EMAIL_VERIFICATION_MINUTES = readBoundedIntegerEnv(
+  "EMAIL_VERIFICATION_MINUTES",
+  60,
+  10,
+  1440,
+);
+
+export const EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN = readBooleanEnv(
+  "EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN",
+  false,
+);
+
 if (isProduction && EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN) {
   throw new Error(
     "EMAIL_VERIFICATION_DEV_EXPOSE_TOKEN cannot be enabled in production.",
   );
 }
 
+/*
+|--------------------------------------------------------------------------
+| Cookie configuration
+|--------------------------------------------------------------------------
+*/
+
 const cookieSameSite = readSameSiteSetting();
 
+/*
+ * SameSite=None requires Secure cookies.
+ *
+ * During local development KOLA uses HTTP,
+ * so SameSite=None must not be enabled there.
+ */
 if (cookieSameSite === "none" && !isProduction) {
   throw new Error("AUTH_COOKIE_SAME_SITE=none requires production HTTPS.");
 }
 
 /*
- * __Host- cookies cannot specify Domain, must use Path=/,
- * and must be Secure.
- */
-export const AUTH_COOKIE_NAME = isProduction
-  ? "__Host-auth_token"
-  : "auth_token";
+|--------------------------------------------------------------------------
+| Authentication cookie names
+|--------------------------------------------------------------------------
+|
+| CUSTOMER and ADMIN deliberately use different cookies.
+|
+| Development:
+|
+| KOLA_customer_session
+| KOLA_admin_session
+|
+| Production:
+|
+| __Host-KOLA_customer_session
+| __Host-KOLA_admin_session
+|
+| __Host- cookies provide stronger browser restrictions:
+|
+| - Secure is required
+| - Path must be /
+| - Domain must not be supplied
+|
+*/
 
-export const getAuthCookieOptions = () => ({
+export const CUSTOMER_AUTH_COOKIE_NAME = isProduction
+  ? "__Host-KOLA_customer_session"
+  : "KOLA_customer_session";
+
+export const ADMIN_AUTH_COOKIE_NAME = isProduction
+  ? "__Host-KOLA_admin_session"
+  : "KOLA_admin_session";
+
+/*
+|--------------------------------------------------------------------------
+| Temporary customer-cookie alias
+|--------------------------------------------------------------------------
+|
+| Older customer-only routes may still import AUTH_COOKIE_NAME.
+|
+| It intentionally points ONLY to the CUSTOMER cookie.
+|
+| New code should prefer the explicit customer/admin constants.
+|
+*/
+
+export const AUTH_COOKIE_NAME = CUSTOMER_AUTH_COOKIE_NAME;
+
+/*
+|--------------------------------------------------------------------------
+| Cookie option builders
+|--------------------------------------------------------------------------
+*/
+
+const buildAuthCookieOptions = () => ({
+  /*
+   * JavaScript running in the browser cannot read
+   * the authentication token.
+   */
   httpOnly: true,
+
+  /*
+   * Production cookies travel only over HTTPS.
+   */
   secure: isProduction,
+
+  /*
+   * Helps protect against cross-site request attacks.
+   */
   sameSite: cookieSameSite,
+
+  /*
+   * Authentication applies across the entire API.
+   */
   path: "/",
 
+  /*
+   * Browser cookie lifetime matches the server session lifetime.
+   */
   maxAge: AUTH_SESSION_SECONDS * 1000,
 });
 
-export const getAuthCookieClearOptions = () => ({
+const buildAuthCookieClearOptions = () => ({
+  /*
+   * Cookie clearing must use the same significant
+   * attributes as cookie creation.
+   */
   httpOnly: true,
   secure: isProduction,
   sameSite: cookieSameSite,
   path: "/",
 });
+
+/*
+|--------------------------------------------------------------------------
+| Customer cookie helpers
+|--------------------------------------------------------------------------
+*/
+
+export const getCustomerAuthCookieOptions = () => buildAuthCookieOptions();
+
+export const getCustomerAuthCookieClearOptions = () =>
+  buildAuthCookieClearOptions();
+
+/*
+|--------------------------------------------------------------------------
+| Admin cookie helpers
+|--------------------------------------------------------------------------
+*/
+
+export const getAdminAuthCookieOptions = () => buildAuthCookieOptions();
+
+export const getAdminAuthCookieClearOptions = () =>
+  buildAuthCookieClearOptions();
+
+/*
+|--------------------------------------------------------------------------
+| Temporary customer helper aliases
+|--------------------------------------------------------------------------
+|
+| Existing customer routes that still use:
+|
+| getAuthCookieOptions()
+| getAuthCookieClearOptions()
+|
+| remain compatible.
+|
+*/
+
+export const getAuthCookieOptions = getCustomerAuthCookieOptions;
+
+export const getAuthCookieClearOptions = getCustomerAuthCookieClearOptions;

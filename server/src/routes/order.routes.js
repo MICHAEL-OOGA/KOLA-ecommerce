@@ -1,13 +1,16 @@
 import express from "express";
-import { z } from "zod";
+import { success, z } from "zod";
 import PrismaPackage from "@prisma/client";
 import rateLimit from "express-rate-limit";
 import prisma from "../config/prisma.js";
 import { createHash } from "node:crypto";
-import { protect, adminOnly } from "../middleware/auth.middleware.js";
+import { protect, protectAdmin } from "../middleware/auth.middleware.js";
 import { getOrderExpiryDate } from "../services/order-expiry.service.js";
 import { requireCsrf } from "../middleware/csrf.middleware.js";
 import { writeSecurityAuditEvent } from "../services/security-audit.service.js";
+import { process } from "zod/v4/core";
+import { tr } from "zod/v4/locales";
+import { error } from "node:console";
 const { Prisma } = PrismaPackage;
 const router = express.Router();
 
@@ -31,56 +34,14 @@ class OrderRequestError extends Error {
   }
 }
 
-const orderItemSchema = z
-  .object({
-    productId: z
-      .string()
-      .trim()
-      .min(1, "Product ID is required.")
-      .max(100, "Product ID is invalid."),
-
-    quantity: z
-      .number()
-      .int("Quantity must be a whole number.")
-      .min(1, "Quantity must be at least 1.")
-      .max(
-        MAX_QUANTITY_PER_PRODUCT,
-        `Quantity cannot exceed ${MAX_QUANTITY_PER_PRODUCT} per product.`,
-      ),
-  })
-  .strict();
-
 const createOrderSchema = z
   .object({
-    customerName: z
-      .string()
-      .trim()
-      .min(2, "Customer name must contain at least 2 characters.")
-      .max(100, "Customer name cannot exceed 100 characters."),
-
-    customerEmail: z
-      .string()
-      .trim()
-      .toLowerCase()
-      .max(254, "Email address cannot exceed 254 characters.")
-      .email("Enter a valid email address.")
-      .optional()
-      .nullable(),
-
     customerPhone: z
       .string()
       .trim()
       .regex(
         /^(?:254|0|\+254)(?:7|1)\d{8}$/,
         "Enter a valid Kenyan phone number.",
-      ),
-
-    items: z
-      .array(orderItemSchema)
-      .min(1, "The order must contain at least one product.")
-      .max(
-        MAX_DISTINCT_PRODUCTS,
-        `An order cannot contain more than ${MAX_DISTINCT_PRODUCTS} product entries.`,
       ),
   })
   .strict();
@@ -96,6 +57,12 @@ const updateOrderStatusSchema = z
     status: z.enum(["PROCESSING", "SHIPPED", "DELIVERED", "CANCELLED"]),
   })
   .strict();
+
+const orderIdSchema = z
+  .string()
+  .trim()
+  .min(1, "Order ID is required.")
+  .max(191, "Order ID is invalid.");
 
 /*
 |--------------------------------------------------------------------------
@@ -151,6 +118,75 @@ const adminOrderListQuerySchema = z
     page: adminOrderPageSchema,
 
     limit: adminOrderLimitSchema,
+
+    status: z
+      .enum([
+        "PENDING",
+        "PAID",
+        "PROCESSING",
+        "SHIPPED",
+        "DELIVERED",
+        "CANCELLED",
+        "EXPIRED",
+      ])
+      .optional(),
+  })
+  .strict();
+
+/*
+|--------------------------------------------------------------------------
+| Customer order-list query validation
+|--------------------------------------------------------------------------
+|
+| Customers may paginate their own order history and optionally
+| filter it by order status.
+*/
+
+const customerOrderPageSchema = z.preprocess(
+  (value) => {
+    if (value === undefined) {
+      return 1;
+    }
+
+    if (typeof value === "string" && /^\d+$/.test(value)) {
+      return Number(value);
+    }
+
+    return value;
+  },
+
+  z
+    .number()
+    .int("Page must be a whole number.")
+    .min(1, "Page must be at least 1.")
+    .max(1000, "Page cannot exceed 1000."),
+);
+
+const customerOrderLimitSchema = z.preprocess(
+  (value) => {
+    if (value === undefined) {
+      return 10;
+    }
+
+    if (typeof value === "string" && /^\d+$/.test(value)) {
+      return Number(value);
+    }
+
+    return value;
+  },
+
+  z
+    .number()
+    .int("Limit must be a whole number.")
+    .min(1, "Limit must be at least 1.")
+    .max(25, "Limit cannot exceed 25 orders per request."),
+);
+
+const customerOrderListQuerySchema = z
+  .object({
+    page: customerOrderPageSchema,
+
+    limit: customerOrderLimitSchema,
 
     status: z
       .enum([
@@ -306,33 +342,10 @@ const getIdempotencyKey = (req) => {
 
 const normalizeCustomerName = (name) => name.trim().replace(/\s+/g, " ");
 
-const buildOrderRequestFingerprint = ({
-  customerName,
-  customerEmail,
-  customerPhone,
-  items,
-}) => {
-  /*
-   * Sort items so that changing their order in the JSON array does not
-   * create a different fingerprint.
-   */
-  const canonicalItems = [...items]
-    .sort((firstItem, secondItem) =>
-      firstItem.productId.localeCompare(secondItem.productId),
-    )
-    .map((item) => ({
-      productId: item.productId,
-      quantity: item.quantity,
-    }));
-
+const buildOrderRequestFingerprint = ({ userId, customerPhone }) => {
   const canonicalRequest = JSON.stringify({
-    customerName: normalizeCustomerName(customerName),
-
-    customerEmail: customerEmail?.toLowerCase() || null,
-
+    userId,
     customerPhone: normalizeKenyanPhone(customerPhone),
-
-    items: canonicalItems,
   });
 
   return createHash("sha256").update(canonicalRequest).digest("hex");
@@ -356,6 +369,121 @@ const orderResponseInclude = {
 const adminOrderResponseInclude = {
   ...orderResponseInclude,
   payment: true,
+};
+
+/*
+|--------------------------------------------------------------------------
+| Customer order response
+|--------------------------------------------------------------------------
+|
+| Only expose information the authenticated customer needs.
+|
+| Internal fields such as:
+|
+| - idempotencyKey
+| - requestFingerprint
+|
+| are deliberately excluded.
+*/
+
+const customerOrderSelect = {
+  id: true,
+
+  customerName: true,
+  customerEmail: true,
+  customerPhone: true,
+
+  totalAmount: true,
+  status: true,
+
+  expiresAt: true,
+  expiredAt: true,
+
+  processingStartedAt: true,
+  shippedAt: true,
+  deliveredAt: true,
+  cancelledAt: true,
+
+  createdAt: true,
+  updatedAt: true,
+
+  items: {
+    select: {
+      id: true,
+      productId: true,
+      quantity: true,
+      price: true,
+
+      product: {
+        select: {
+          id: true,
+          name: true,
+          slug: true,
+          imageUrl: true,
+        },
+      },
+    },
+  },
+
+  payment: {
+    select: {
+      method: true,
+      status: true,
+      amount: true,
+      phoneNumber: true,
+
+      mpesaReceiptNumber: true,
+
+      verifiedAt: true,
+      paidAt: true,
+    },
+  },
+};
+
+/*
+|--------------------------------------------------------------------------
+| Customer order-list response
+|--------------------------------------------------------------------------
+|
+| This is intentionally smaller than customerOrderSelect.
+|
+| The history page only needs summary information.
+| Full order contents are retrieved from GET /api/orders/:id.
+*/
+
+const customerOrderListSelect = {
+  id: true,
+
+  totalAmount: true,
+
+  status: true,
+
+  expiresAt: true,
+  expiredAt: true,
+
+  processingStartedAt: true,
+  shippedAt: true,
+  deliveredAt: true,
+  cancelledAt: true,
+
+  createdAt: true,
+  updatedAt: true,
+
+  payment: {
+    select: {
+      method: true,
+
+      status: true,
+
+      paidAt: true,
+    },
+  },
+
+  _count: {
+    select: {
+      items: true,
+    },
+  },
 };
 
 /*
@@ -447,97 +575,96 @@ const runSerializableTransactionWithRetry = async (
 
 /*
 |--------------------------------------------------------------------------
-| Combine duplicate products
-|--------------------------------------------------------------------------
-| If the request accidentally contains the same product twice, we combine
-| its quantities before processing the order.
-*/
-
-const combineDuplicateItems = (items) => {
-  const combinedItems = new Map();
-  let totalOrderUnits = 0;
-
-  for (const item of items) {
-    const currentQuantity = combinedItems.get(item.productId) || 0;
-
-    const combinedQuantity = currentQuantity + item.quantity;
-
-    /*
-     * The same product may appear more than once in the request.
-     * Its combined quantity must still respect the per-product limit.
-     */
-    if (combinedQuantity > MAX_QUANTITY_PER_PRODUCT) {
-      throw new OrderRequestError(
-        400,
-        "PRODUCT_QUANTITY_LIMIT",
-        `Combined quantity cannot exceed ${MAX_QUANTITY_PER_PRODUCT} units per product.`,
-      );
-    }
-
-    totalOrderUnits += item.quantity;
-
-    if (totalOrderUnits > MAX_TOTAL_ORDER_UNITS) {
-      throw new OrderRequestError(
-        400,
-        "TOTAL_QUANTITY_LIMIT",
-        `An order cannot contain more than ${MAX_TOTAL_ORDER_UNITS} total units.`,
-      );
-    }
-
-    combinedItems.set(item.productId, combinedQuantity);
-  }
-
-  return Array.from(combinedItems, ([productId, quantity]) => ({
-    productId,
-    quantity,
-  }));
-};
-
-/*
-|--------------------------------------------------------------------------
 | POST /api/orders
 |--------------------------------------------------------------------------
-| Creates an order.
-| This route currently supports guest checkout.
+|
+| Converts the authenticated customer's server-side cart into an order.
+|
+| SECURITY:
+|
+| The browser does NOT send:
+|
+| - userId
+| - customer name
+| - customer email
+| - product IDs
+| - quantities
+| - prices
+| - total
+|
+| The only checkout-specific value supplied by the customer is the
+| M-Pesa phone number.
 */
 
-router.post("/", createOrderLimiter, async (req, res) => {
+router.post("/", createOrderLimiter, protect, requireCsrf, async (req, res) => {
   let idempotencyKey = null;
   let requestFingerprint = null;
+
   try {
+    /*
+      |--------------------------------------------------------------------------
+      | Validate checkout-specific input
+      |--------------------------------------------------------------------------
+      */
+
     const result = createOrderSchema.safeParse(req.body);
 
     if (!result.success) {
       return res.status(400).json({
         success: false,
-        message: "Invalid order information.",
+
+        message: "Invalid checkout information.",
 
         errors: formatValidationErrors(result.error.issues),
       });
     }
 
-    const { customerName, customerEmail, customerPhone, items } = result.data;
+    const { customerPhone } = result.data;
 
     const normalizedPhone = normalizeKenyanPhone(customerPhone);
 
-    const combinedItems = combineDuplicateItems(items);
+    /*
+      |--------------------------------------------------------------------------
+      | Authenticated customer identity
+      |--------------------------------------------------------------------------
+      |
+      | protect already populated req.user from the authenticated,
+      | revocable server session.
+      */
+
+    const userId = req.user.id;
+
+    const customerName = normalizeCustomerName(req.user.fullName);
+
+    const customerEmail = req.user.email;
+
+    /*
+      |--------------------------------------------------------------------------
+      | Idempotency
+      |--------------------------------------------------------------------------
+      */
 
     idempotencyKey = getIdempotencyKey(req);
 
-    const normalizedCustomerName = normalizeCustomerName(customerName);
-
     requestFingerprint = buildOrderRequestFingerprint({
-      customerName: normalizedCustomerName,
+      userId,
 
-      customerEmail,
       customerPhone: normalizedPhone,
-
-      items: combinedItems,
     });
 
     /*
-     * Fast replay check before beginning the stock transaction.
-     */
+      |--------------------------------------------------------------------------
+      | Fast replay check
+      |--------------------------------------------------------------------------
+      |
+      | This happens BEFORE reading the cart.
+      |
+      | That's important because a successful checkout deletes the cart.
+      |
+      | If the client lost the original HTTP response and retries with the
+      | same Idempotency-Key, we can still return the already-created order.
+      */
+
     const existingOrder = await prisma.order.findUnique({
       where: {
         idempotencyKey,
@@ -547,30 +674,164 @@ router.post("/", createOrderLimiter, async (req, res) => {
     });
 
     if (existingOrder) {
+      /*
+       * A customer's idempotency key must never expose
+       * another customer's order.
+       */
+
+      if (existingOrder.userId !== userId) {
+        throw new OrderRequestError(
+          409,
+          "IDEMPOTENCY_KEY_REUSED",
+          "This Idempotency-Key cannot be used for this checkout.",
+        );
+      }
+
       if (existingOrder.requestFingerprint !== requestFingerprint) {
         throw new OrderRequestError(
           409,
           "IDEMPOTENCY_KEY_REUSED",
-          "This Idempotency-Key has already been used for a different order request.",
+          "This Idempotency-Key has already been used for a different checkout.",
         );
       }
 
       return res.status(200).json({
         success: true,
+
         replayed: true,
+
         message: "This order was already created.",
+
         order: existingOrder,
       });
     }
 
-    const productIds = combinedItems.map((item) => item.productId);
+    /*
+      |--------------------------------------------------------------------------
+      | Convert cart → order
+      |--------------------------------------------------------------------------
+      */
 
-    const order = await prisma.$transaction(
+    const transactionResult = await runSerializableTransactionWithRetry(
       async (transaction) => {
         /*
-         * Retrieve prices and stock from our database.
-         * Nothing financial is trusted from the browser.
-         */
+            |--------------------------------------------------------------------------
+            | Re-check idempotency INSIDE transaction
+            |--------------------------------------------------------------------------
+            |
+            | Protects against concurrent identical requests and transaction
+            | retries.
+            */
+
+        const replayedOrder = await transaction.order.findUnique({
+          where: {
+            idempotencyKey,
+          },
+
+          include: orderResponseInclude,
+        });
+
+        if (replayedOrder) {
+          if (
+            replayedOrder.userId !== userId ||
+            replayedOrder.requestFingerprint !== requestFingerprint
+          ) {
+            throw new OrderRequestError(
+              409,
+              "IDEMPOTENCY_KEY_REUSED",
+              "This Idempotency-Key has already been used for a different checkout.",
+            );
+          }
+
+          return {
+            order: replayedOrder,
+
+            replayed: true,
+          };
+        }
+
+        /*
+            |--------------------------------------------------------------------------
+            | Load authenticated customer's cart
+            |--------------------------------------------------------------------------
+            */
+
+        const cart = await transaction.cart.findUnique({
+          where: {
+            userId,
+          },
+
+          select: {
+            id: true,
+
+            items: {
+              select: {
+                productId: true,
+
+                quantity: true,
+              },
+            },
+          },
+        });
+
+        if (!cart || cart.items.length === 0) {
+          throw new OrderRequestError(400, "CART_EMPTY", "Your cart is empty.");
+        }
+
+        /*
+            |--------------------------------------------------------------------------
+            | Cart limits
+            |--------------------------------------------------------------------------
+            */
+
+        if (cart.items.length > MAX_DISTINCT_PRODUCTS) {
+          throw new OrderRequestError(
+            400,
+            "TOO_MANY_PRODUCTS",
+            `An order cannot contain more than ${MAX_DISTINCT_PRODUCTS} different products.`,
+          );
+        }
+
+        let totalOrderUnits = 0;
+
+        for (const item of cart.items) {
+          if (!Number.isSafeInteger(item.quantity) || item.quantity <= 0) {
+            throw new OrderRequestError(
+              400,
+              "INVALID_CART_QUANTITY",
+              "Your cart contains an invalid quantity.",
+            );
+          }
+
+          if (item.quantity > MAX_QUANTITY_PER_PRODUCT) {
+            throw new OrderRequestError(
+              400,
+              "PRODUCT_QUANTITY_LIMIT",
+              `An order cannot contain more than ${MAX_QUANTITY_PER_PRODUCT} units of one product.`,
+            );
+          }
+
+          totalOrderUnits += item.quantity;
+
+          if (totalOrderUnits > MAX_TOTAL_ORDER_UNITS) {
+            throw new OrderRequestError(
+              400,
+              "TOTAL_QUANTITY_LIMIT",
+              `An order cannot contain more than ${MAX_TOTAL_ORDER_UNITS} total units.`,
+            );
+          }
+        }
+
+        const productIds = cart.items.map((item) => item.productId);
+
+        /*
+            |--------------------------------------------------------------------------
+            | Load authoritative products
+            |--------------------------------------------------------------------------
+            |
+            | Current prices and stock come from PostgreSQL.
+            */
+
         const products = await transaction.product.findMany({
           where: {
             id: {
@@ -583,9 +844,9 @@ router.post("/", createOrderLimiter, async (req, res) => {
 
         if (products.length !== productIds.length) {
           throw new OrderRequestError(
-            400,
+            409,
             "PRODUCT_UNAVAILABLE",
-            "One or more selected products are unavailable.",
+            "One or more products in your cart are no longer available.",
           );
         }
 
@@ -597,14 +858,20 @@ router.post("/", createOrderLimiter, async (req, res) => {
 
         const preparedItems = [];
 
-        for (const item of combinedItems) {
+        /*
+            |--------------------------------------------------------------------------
+            | Validate stock and calculate authoritative total
+            |--------------------------------------------------------------------------
+            */
+
+        for (const item of cart.items) {
           const product = productsById.get(item.productId);
 
           if (!product) {
             throw new OrderRequestError(
-              400,
+              409,
               "PRODUCT_UNAVAILABLE",
-              "A selected product is unavailable.",
+              "A product in your cart is no longer available.",
             );
           }
 
@@ -616,9 +883,6 @@ router.post("/", createOrderLimiter, async (req, res) => {
             );
           }
 
-          /*
-           * The product price comes exclusively from PostgreSQL.
-           */
           const itemTotal = product.price.mul(item.quantity);
 
           totalAmount = totalAmount.add(itemTotal);
@@ -627,6 +891,11 @@ router.post("/", createOrderLimiter, async (req, res) => {
             productId: product.id,
 
             quantity: item.quantity,
+
+            /*
+             * Snapshot current price into the
+             * OrderItem.
+             */
 
             price: product.price,
           });
@@ -641,12 +910,18 @@ router.post("/", createOrderLimiter, async (req, res) => {
         }
 
         /*
-         * Each stock update includes stock >= requested quantity.
-         *
-         * Even if another customer buys the product between our
-         * initial lookup and this update, stock cannot become negative.
-         */
-        for (const item of combinedItems) {
+            |--------------------------------------------------------------------------
+            | Reserve inventory
+            |--------------------------------------------------------------------------
+            |
+            | IMPORTANT:
+            |
+            | `stock >= quantity` is checked INSIDE each UPDATE.
+            |
+            | Therefore two concurrent checkouts cannot make stock negative.
+            */
+
+        for (const item of cart.items) {
           const stockUpdate = await transaction.product.updateMany({
             where: {
               id: item.productId,
@@ -671,25 +946,44 @@ router.post("/", createOrderLimiter, async (req, res) => {
             throw new OrderRequestError(
               409,
               "INSUFFICIENT_STOCK",
-              `${product?.name || "A selected product"} no longer has enough stock.`,
+              `${
+                product?.name || "A product in your cart"
+              } no longer has enough stock.`,
             );
           }
         }
 
-        return transaction.order.create({
-          data: {
-            customerName: normalizedCustomerName,
+        /*
+            |--------------------------------------------------------------------------
+            | Create order
+            |--------------------------------------------------------------------------
+            */
 
-            customerEmail: customerEmail || null,
+        const order = await transaction.order.create({
+          data: {
+            /*
+             * Critical:
+             *
+             * New orders now belong to the
+             * authenticated customer.
+             */
+
+            userId,
+
+            customerName,
+
+            customerEmail,
 
             customerPhone: normalizedPhone,
 
             totalAmount,
+
             status: "PENDING",
 
             expiresAt: getOrderExpiryDate(),
 
             idempotencyKey,
+
             requestFingerprint,
 
             items: {
@@ -699,34 +993,74 @@ router.post("/", createOrderLimiter, async (req, res) => {
 
           include: orderResponseInclude,
         });
-      },
 
-      {
-        isolationLevel: "Serializable",
+        /*
+            |--------------------------------------------------------------------------
+            | Consume the cart
+            |--------------------------------------------------------------------------
+            |
+            | CartItem rows disappear through the Cart → CartItem cascade.
+            |
+            | This happens inside the SAME transaction as:
+            |
+            | - stock reservation
+            | - Order creation
+            |
+            | Therefore:
+            |
+            | order fails → cart remains
+            | stock fails → cart remains
+            | cart deletion fails → whole order rolls back
+            */
+
+        await transaction.cart.delete({
+          where: {
+            id: cart.id,
+          },
+        });
+
+        return {
+          order,
+
+          replayed: false,
+        };
       },
     );
 
-    return res.status(201).json({
+    return res.status(transactionResult.replayed ? 200 : 201).json({
       success: true,
-      message: "Order created successfully.",
-      order,
+
+      replayed: transactionResult.replayed,
+
+      message: transactionResult.replayed
+        ? "This order was already created."
+        : "Order created successfully.",
+
+      order: transactionResult.order,
     });
   } catch (error) {
+    /*
+      |--------------------------------------------------------------------------
+      | Expected checkout errors
+      |--------------------------------------------------------------------------
+      */
+
     if (error instanceof OrderRequestError) {
       return res.status(error.statusCode).json({
         success: false,
+
         code: error.code,
+
         message: error.message,
       });
     }
 
     /*
-     * Two identical requests might arrive simultaneously.
-     *
-     * PostgreSQL's unique idempotencyKey constraint allows only one
-     * transaction to create the order. The losing request retrieves and
-     * returns the order created by the winning request.
-     */
+      |--------------------------------------------------------------------------
+      | Simultaneous idempotent requests
+      |--------------------------------------------------------------------------
+      */
+
     if (error?.code === "P2002" && idempotencyKey && requestFingerprint) {
       const existingOrder = await prisma.order.findUnique({
         where: {
@@ -736,19 +1070,19 @@ router.post("/", createOrderLimiter, async (req, res) => {
         include: orderResponseInclude,
       });
 
-      if (existingOrder) {
-        if (existingOrder.requestFingerprint !== requestFingerprint) {
-          return res.status(409).json({
-            success: false,
-            code: "IDEMPOTENCY_KEY_REUSED",
+      /*
+       * Never return an order belonging to
+       * another account.
+       */
 
-            message:
-              "This Idempotency-Key has already been used for a different order request.",
-          });
-        }
-
+      if (
+        existingOrder &&
+        existingOrder.userId === req.user?.id &&
+        existingOrder.requestFingerprint === requestFingerprint
+      ) {
         return res.status(200).json({
           success: true,
+
           replayed: true,
 
           message: "This order was already created.",
@@ -756,30 +1090,44 @@ router.post("/", createOrderLimiter, async (req, res) => {
           order: existingOrder,
         });
       }
+
+      return res.status(409).json({
+        success: false,
+
+        code: "IDEMPOTENCY_KEY_REUSED",
+
+        message: "This Idempotency-Key cannot be used for this checkout.",
+      });
     }
 
     /*
-     * Prisma may abort a serializable transaction when another checkout
-     * changes the same stock at the same time.
-     */
+      |--------------------------------------------------------------------------
+      | Serializable concurrency conflict
+      |--------------------------------------------------------------------------
+      */
+
     if (error?.code === "P2034") {
       return res.status(409).json({
         success: false,
+
         code: "ORDER_CONCURRENCY_CONFLICT",
 
         message:
-          "Product availability changed while the order was being created. Please try again.",
+          "Product availability changed while your order was being created. Please try again.",
       });
     }
 
     console.error("Create order error:", {
-      name: error.name,
-      code: error.code,
-      message: error.message,
+      name: error?.name,
+
+      code: error?.code,
+
+      message: error?.message,
     });
 
     return res.status(500).json({
       success: false,
+
       message: "Failed to create order safely.",
     });
   }
@@ -799,8 +1147,7 @@ router.post("/", createOrderLimiter, async (req, res) => {
 
 router.get(
   "/admin/all",
-  protect,
-  adminOnly,
+  protectAdmin,
   adminOrderReadLimiter,
   async (req, res) => {
     try {
@@ -899,12 +1246,186 @@ router.get(
 
 /*
 |--------------------------------------------------------------------------
+| GET /api/orders/admin/summary
+|--------------------------------------------------------------------------
+|
+| Returns a lightweight overview for the admin dashboard.
+|
+| SECURITY:
+|
+| - authenticated session required
+| - ADMIN role required
+| - no customer can access these aggregate business metrics
+*/
+
+router.get(
+  "/admin/summary",
+  protectAdmin,
+  adminOrderReadLimiter,
+  async (req, res) => {
+    try {
+      const [
+        totalOrders,
+        pendingOrders,
+        paidOrders,
+        processingOrders,
+        shippedOrders,
+        deliveredOrders,
+        cancelledOrders,
+        expiredOrders,
+        successfulPayments,
+        recentOrders,
+      ] = await prisma.$transaction([
+        prisma.order.count(),
+
+        prisma.order.count({
+          where: {
+            status: "PENDING",
+          },
+        }),
+
+        prisma.order.count({
+          where: {
+            status: "PAID",
+          },
+        }),
+
+        prisma.order.count({
+          where: {
+            status: "PROCESSING",
+          },
+        }),
+
+        prisma.order.count({
+          where: {
+            status: "SHIPPED",
+          },
+        }),
+
+        prisma.order.count({
+          where: {
+            status: "DELIVERED",
+          },
+        }),
+
+        prisma.order.count({
+          where: {
+            status: "CANCELLED",
+          },
+        }),
+
+        prisma.order.count({
+          where: {
+            status: "EXPIRED",
+          },
+        }),
+
+        /*
+         * Revenue comes from verified SUCCESS payments,
+         * not from browser totals or merely-created orders.
+         */
+        prisma.payment.aggregate({
+          where: {
+            status: "SUCCESS",
+          },
+
+          _sum: {
+            amount: true,
+          },
+
+          _count: {
+            _all: true,
+          },
+        }),
+
+        prisma.order.findMany({
+          take: 5,
+
+          orderBy: [
+            {
+              createdAt: "desc",
+            },
+            {
+              id: "desc",
+            },
+          ],
+
+          select: {
+            id: true,
+
+            customerName: true,
+
+            totalAmount: true,
+
+            status: true,
+
+            createdAt: true,
+
+            payment: {
+              select: {
+                status: true,
+              },
+            },
+
+            _count: {
+              select: {
+                items: true,
+              },
+            },
+          },
+        }),
+      ]);
+
+      return res.status(200).json({
+        success: true,
+
+        summary: {
+          totalOrders,
+
+          statuses: {
+            pending: pendingOrders,
+            paid: paidOrders,
+            processing: processingOrders,
+            shipped: shippedOrders,
+            delivered: deliveredOrders,
+            cancelled: cancelledOrders,
+            expired: expiredOrders,
+          },
+
+          payments: {
+            successfulPayments: successfulPayments._count._all,
+
+            totalRevenue:
+              successfulPayments._sum.amount || new Prisma.Decimal(0),
+          },
+        },
+
+        recentOrders,
+      });
+    } catch (error) {
+      console.error("Get admin dashboard summary error:", {
+        name: error?.name,
+        code: error?.code,
+        message: error?.message,
+      });
+
+      return res.status(500).json({
+        success: false,
+
+        message: "Failed to retrieve dashboard summary.",
+      });
+    }
+  },
+);
+
+/*
+|--------------------------------------------------------------------------
 | GET /api/orders/admin/:id
 |--------------------------------------------------------------------------
 | Admins can view one complete order.
 */
 
-router.get("/admin/:id", protect, adminOnly, async (req, res) => {
+router.get("/admin/:id", protectAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -972,8 +1493,7 @@ router.get("/admin/:id", protect, adminOnly, async (req, res) => {
 
 router.patch(
   "/admin/:id/status",
-  protect,
-  adminOnly,
+  protectAdmin,
   requireCsrf,
   async (req, res) => {
     try {
@@ -1315,5 +1835,226 @@ router.patch(
     }
   },
 );
+
+/*
+|--------------------------------------------------------------------------
+| GET /api/orders
+|--------------------------------------------------------------------------
+|
+| Returns the authenticated customer's own order history.
+|
+| SECURITY:
+|
+| - userId comes exclusively from req.user.id
+| - the browser cannot request another customer's orders
+| - no internal payment-attempt/provider information is exposed
+| - results are paginated
+|
+| Supported query parameters:
+|
+| - page
+| - limit
+| - status
+*/
+
+router.get("/", protect, async (req, res) => {
+  try {
+    const validationResult = customerOrderListQuerySchema.safeParse(req.query);
+
+    if (!validationResult.success) {
+      return res.status(400).json({
+        success: false,
+
+        message: "Invalid order-history query.",
+
+        errors: formatValidationErrors(validationResult.error.issues),
+      });
+    }
+
+    const { page, limit, status } = validationResult.data;
+
+    const skip = (page - 1) * limit;
+
+    /*
+     * Critical ownership boundary.
+     *
+     * userId never comes from req.query,
+     * req.body or req.params.
+     */
+    const where = {
+      userId: req.user.id,
+
+      ...(status
+        ? {
+            status,
+          }
+        : {}),
+    };
+
+    /*
+     * Retrieve the total and requested page
+     * from the same database snapshot.
+     */
+    const [totalOrders, orders] = await prisma.$transaction([
+      prisma.order.count({
+        where,
+      }),
+
+      prisma.order.findMany({
+        where,
+
+        skip,
+
+        take: limit,
+
+        select: customerOrderListSelect,
+
+        /*
+         * Newest orders first.
+         *
+         * id provides deterministic ordering
+         * if two timestamps happen to match.
+         */
+        orderBy: [
+          {
+            createdAt: "desc",
+          },
+
+          {
+            id: "desc",
+          },
+        ],
+      }),
+    ]);
+
+    const totalPages = totalOrders === 0 ? 0 : Math.ceil(totalOrders / limit);
+
+    return res.status(200).json({
+      success: true,
+
+      filters: {
+        status: status || null,
+      },
+
+      pagination: {
+        page,
+
+        limit,
+
+        totalOrders,
+
+        totalPages,
+
+        returnedOrders: orders.length,
+
+        hasPreviousPage: page > 1,
+
+        hasNextPage: page < totalPages,
+      },
+
+      orders,
+    });
+  } catch (error) {
+    console.error("Get customer order history error:", {
+      name: error?.name,
+
+      code: error?.code,
+
+      message: error?.message,
+    });
+
+    return res.status(500).json({
+      success: false,
+
+      message: "Failed to retrieve your order history.",
+    });
+  }
+});
+
+/*
+|--------------------------------------------------------------------------
+| GET /api/orders/:id
+|--------------------------------------------------------------------------
+|
+| Returns one order belonging to the authenticated customer.
+|
+| SECURITY:
+|
+| The order must belong to req.user.id.
+|
+| An order belonging to another customer is treated exactly like an order
+| that does not exist. This avoids leaking information about other orders.
+*/
+
+router.get("/:id", protect, async (req, res) => {
+  try {
+    const validationResult = orderIdSchema.safeParse(req.params.id);
+
+    if (!validationResult.success) {
+      return res.status(400).json({
+        success: false,
+
+        message: "Invalid order ID.",
+
+        errors: formatValidationErrors(validationResult.error.issues),
+      });
+    }
+
+    const orderId = validationResult.data;
+
+    /*
+     * IMPORTANT:
+     *
+     * Ownership is checked directly in the
+     * database query.
+     */
+
+    const order = await prisma.order.findFirst({
+      where: {
+        id: orderId,
+
+        userId: req.user.id,
+      },
+
+      select: customerOrderSelect,
+    });
+
+    /*
+     * We return the same 404 whether:
+     *
+     * - the order does not exist
+     * - it exists but belongs to somebody else
+     */
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+
+        code: "ORDER_NOT_FOUND",
+
+        message: "Order not found.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      order,
+    });
+  } catch (error) {
+    console.error("Get customer order error:", {
+      name: error?.name,
+
+      code: error?.code,
+
+      message: error?.message,
+    });
+
+    return res.status(500).json({
+      success: false,
+
+      message: "Failed to retrieve the order.",
+    });
+  }
+});
 
 export default router;

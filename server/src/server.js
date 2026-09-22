@@ -1,12 +1,21 @@
 import "dotenv/config";
 
 import app from "./app.js";
-import prisma from "./config/prisma.js";
+
+import prisma, { postgresPool } from "./config/prisma.js";
+
 import {
   startOrderExpiryWorker,
   stopOrderExpiryWorker,
 } from "./services/order-expiry.service.js";
+
+import {
+  startMpesaReconciliationWorker,
+  stopMpesaReconciliationWorker,
+} from "./services/mpesa-reconciliation.service.js";
+
 import { validateRuntimeSecurityConfiguration } from "./config/security.config.js";
+
 import {
   startSecurityCleanupWorker,
   stopSecurityCleanupWorker,
@@ -14,24 +23,79 @@ import {
 
 /*
 |--------------------------------------------------------------------------
-| Fail-fast runtime security validation
+| Runtime security validation
 |--------------------------------------------------------------------------
+|
+| Never begin accepting HTTP traffic until security configuration
+| has been validated.
 */
 
 validateRuntimeSecurityConfiguration();
 
 console.log("Runtime security configuration validated.");
 
-const PORT = Number(process.env.PORT) || 5000;
+/*
+|--------------------------------------------------------------------------
+| Port validation
+|--------------------------------------------------------------------------
+*/
+
+const readPort = () => {
+  const rawPort = process.env.PORT?.trim() || "5000";
+
+  if (!/^\d+$/.test(rawPort)) {
+    throw new Error("PORT must be a whole number.");
+  }
+
+  const port = Number(rawPort);
+
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+    throw new Error("PORT must be between 1 and 65535.");
+  }
+
+  return port;
+};
+
+const PORT = readPort();
+
+/*
+|--------------------------------------------------------------------------
+| Database startup check
+|--------------------------------------------------------------------------
+|
+| Fail before listening for requests when PostgreSQL cannot be reached.
+*/
+
+try {
+  await prisma.$connect();
+
+  console.log("Database connection established.");
+} catch (error) {
+  console.error("Database startup connection failed:", {
+    name: error?.name,
+    code: error?.code,
+    message: error?.message,
+  });
+
+  process.exit(1);
+}
+
+/*
+|--------------------------------------------------------------------------
+| Start HTTP server
+|--------------------------------------------------------------------------
+*/
 
 let shutdownStarted = false;
 
 const server = app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`KOLA API listening on port ${PORT}.`);
 
   startOrderExpiryWorker();
 
   startSecurityCleanupWorker();
+
+  startMpesaReconciliationWorker();
 });
 
 /*
@@ -41,19 +105,25 @@ const server = app.listen(PORT, () => {
 */
 
 server.requestTimeout = 30_000;
+
 server.headersTimeout = 15_000;
+
 server.keepAliveTimeout = 5_000;
 
 server.maxHeadersCount = 100;
+
 server.maxRequestsPerSocket = 1_000;
 
 /*
- * Reject malformed HTTP requests without passing them into Express.
- */
+|--------------------------------------------------------------------------
+| Malformed HTTP protection
+|--------------------------------------------------------------------------
+*/
+
 server.on("clientError", (error, socket) => {
   console.error("Malformed HTTP request rejected:", {
-    code: error.code,
-    message: error.message,
+    code: error?.code,
+    message: error?.message,
   });
 
   if (socket.writable) {
@@ -66,6 +136,12 @@ server.on("clientError", (error, socket) => {
   }
 });
 
+/*
+|--------------------------------------------------------------------------
+| Graceful shutdown
+|--------------------------------------------------------------------------
+*/
+
 const shutdown = (signal, exitCode = 0) => {
   if (shutdownStarted) {
     return;
@@ -76,7 +152,10 @@ const shutdown = (signal, exitCode = 0) => {
   console.log(`${signal} received. Shutting down safely...`);
 
   stopOrderExpiryWorker();
+
   stopSecurityCleanupWorker();
+
+  stopMpesaReconciliationWorker();
 
   const forcedShutdownTimer = setTimeout(() => {
     console.error("Forced shutdown after waiting for active requests.");
@@ -91,9 +170,10 @@ const shutdown = (signal, exitCode = 0) => {
   server.close(async (error) => {
     try {
       await prisma.$disconnect();
+      await postgresPool.end();
     } catch (disconnectError) {
       console.error("Prisma disconnect error:", {
-        message: disconnectError.message,
+        message: disconnectError?.message,
       });
     } finally {
       clearTimeout(forcedShutdownTimer);
@@ -101,7 +181,7 @@ const shutdown = (signal, exitCode = 0) => {
 
     if (error) {
       console.error("HTTP server shutdown error:", {
-        message: error.message,
+        message: error?.message,
       });
 
       process.exit(1);
@@ -113,10 +193,17 @@ const shutdown = (signal, exitCode = 0) => {
   });
 
   /*
-   * Close idle keep-alive sockets immediately while active requests finish.
+   * Stop accepting unused keep-alive connections while
+   * allowing currently active requests to finish.
    */
   server.closeIdleConnections?.();
 };
+
+/*
+|--------------------------------------------------------------------------
+| Process lifecycle
+|--------------------------------------------------------------------------
+*/
 
 process.on("SIGINT", () => {
   shutdown("SIGINT");
@@ -136,8 +223,8 @@ process.on("unhandledRejection", (reason) => {
 
 process.on("uncaughtException", (error) => {
   console.error("Uncaught exception:", {
-    name: error.name,
-    message: error.message,
+    name: error?.name,
+    message: error?.message,
   });
 
   shutdown("UNCAUGHT_EXCEPTION", 1);

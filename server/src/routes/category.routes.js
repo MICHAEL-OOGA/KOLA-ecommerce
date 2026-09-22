@@ -1,7 +1,7 @@
 import express from "express";
-import { z } from "zod";
+import { success, z } from "zod";
 import prisma from "../config/prisma.js";
-import { protect, adminOnly } from "../middleware/auth.middleware.js";
+import { protectAdmin } from "../middleware/auth.middleware.js";
 import { requireCsrf } from "../middleware/csrf.middleware.js";
 import { writeSecurityAuditEvent } from "../services/security-audit.service.js";
 const router = express.Router();
@@ -35,7 +35,7 @@ const updateCategorySchema = createCategorySchema
 
 const formatValidationErrors = (issues) => {
   return issues.map((issue) => ({
-    field: issue.path.join("."),
+    field: issue.path.length > 0 ? issue.path.join(".") : "body",
     message: issue.message,
   }));
 };
@@ -47,13 +47,26 @@ const formatValidationErrors = (issues) => {
 router.get("/", async (req, res) => {
   try {
     const categories = await prisma.category.findMany({
+      where: {
+        products: {
+          some: {
+            isActive: true,
+          },
+        },
+      },
+
       orderBy: {
         name: "asc",
       },
+
       include: {
         _count: {
           select: {
-            products: true,
+            products: {
+              where: {
+                isActive: true,
+              },
+            },
           },
         },
       },
@@ -74,11 +87,54 @@ router.get("/", async (req, res) => {
   }
 });
 
+/*
+|--------------------------------------------------------------------------
+| GET /api/categories/admin/all
+|--------------------------------------------------------------------------
+|
+| ADMIN only.
+|
+| Unlike the public category endpoint, product counts here include
+| both active and inactive products because administrators need the
+| complete catalogue relationship.
+*/
+
+router.get("/admin/all", protectAdmin, async (req, res) => {
+  try {
+    const categories = await prisma.category.findMany({
+      orderBy: {
+        name: "asc",
+      },
+
+      include: {
+        _count: {
+          select: {
+            products: true,
+          },
+        },
+      },
+    });
+
+    return res.status(200).json({
+      success: true,
+      count: categories.length,
+      categories,
+    });
+  } catch (error) {
+    console.error("Get admin categories error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to retrieve admin categories.",
+    });
+  }
+});
+
 /**
  * POST /api/categories
  * Protected route: only admins can create categories.
  */
-router.post("/", protect, adminOnly, requireCsrf, async (req, res) => {
+router.post("/", protectAdmin, requireCsrf, async (req, res) => {
   try {
     const result = createCategorySchema.safeParse(req.body);
 
@@ -161,7 +217,7 @@ router.post("/", protect, adminOnly, requireCsrf, async (req, res) => {
  * PATCH /api/categories/:id
  * Protected route: only admins can edit categories.
  */
-router.patch("/:id", protect, adminOnly, requireCsrf, async (req, res) => {
+router.patch("/:id", protectAdmin, requireCsrf, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -271,7 +327,7 @@ router.patch("/:id", protect, adminOnly, requireCsrf, async (req, res) => {
  * DELETE /api/categories/:id
  * Protected route: only admins can delete categories.
  */
-router.delete("/:id", protect, adminOnly, requireCsrf, async (req, res) => {
+router.delete("/:id", protectAdmin, requireCsrf, async (req, res) => {
   try {
     const { id } = req.params;
 

@@ -2,6 +2,14 @@
 |--------------------------------------------------------------------------
 | HTTP and API configuration
 |--------------------------------------------------------------------------
+|
+| This module controls:
+| - trusted browser origins
+| - reverse-proxy trust
+| - HTTPS enforcement
+| - global API rate limiting
+|
+| Production configuration fails closed.
 */
 
 const readBoundedIntegerEnv = (name, fallback, minimum, maximum) => {
@@ -66,6 +74,16 @@ export const normalizeOrigin = (value) => {
       return null;
     }
 
+    /*
+     * Trusted CORS values must represent origins only.
+     *
+     * Valid:
+     * https://shop.example.com
+     *
+     * Invalid:
+     * https://shop.example.com/path
+     * https://user:pass@example.com
+     */
     if (
       parsedUrl.username ||
       parsedUrl.password ||
@@ -82,10 +100,33 @@ export const normalizeOrigin = (value) => {
   }
 };
 
+const isLoopbackHostname = (hostname) => {
+  const normalizedHostname = String(hostname || "").toLowerCase();
+
+  return (
+    normalizedHostname === "localhost" ||
+    normalizedHostname === "127.0.0.1" ||
+    normalizedHostname === "::1" ||
+    normalizedHostname === "[::1]" ||
+    normalizedHostname.endsWith(".localhost")
+  );
+};
+
+const configuredClientOriginValue =
+  process.env.CLIENT_URLS?.trim() || process.env.CLIENT_URL?.trim() || null;
+
+/*
+ * Development gets a convenient default.
+ *
+ * Production gets NO default.
+ */
 const rawClientOrigins =
-  process.env.CLIENT_URLS?.trim() ||
-  process.env.CLIENT_URL?.trim() ||
-  "http://localhost:5173";
+  configuredClientOriginValue ||
+  (IS_PRODUCTION ? null : "http://localhost:5173,http://localhost:5174");
+
+if (!rawClientOrigins) {
+  throw new Error("CLIENT_URLS is required when NODE_ENV=production.");
+}
 
 const configuredClientOrigins = rawClientOrigins
   .split(",")
@@ -96,6 +137,26 @@ const configuredClientOrigins = rawClientOrigins
 
     if (!normalizedOrigin) {
       throw new Error(`Invalid trusted client origin: ${origin}`);
+    }
+
+    const parsedOrigin = new URL(normalizedOrigin);
+
+    /*
+     * Production browser origins must use HTTPS
+     * and must not point at localhost.
+     */
+    if (IS_PRODUCTION) {
+      if (parsedOrigin.protocol !== "https:") {
+        throw new Error(
+          `Production trusted origin must use HTTPS: ${normalizedOrigin}`,
+        );
+      }
+
+      if (isLoopbackHostname(parsedOrigin.hostname)) {
+        throw new Error(
+          `Production trusted origin cannot use localhost: ${normalizedOrigin}`,
+        );
+      }
     }
 
     return normalizedOrigin;
@@ -119,9 +180,23 @@ export const isTrustedClientOrigin = (value) => {
 
 /*
 |--------------------------------------------------------------------------
-| Proxy and transport security
+| Proxy security
 |--------------------------------------------------------------------------
+|
+| Express must trust only the number of proxy hops actually used
+| by the production hosting environment.
+|
+| Trusting too many proxy hops can allow attacker-controlled
+| X-Forwarded-* headers to influence security decisions.
 */
+
+const trustProxyValue = process.env.TRUST_PROXY_HOPS?.trim();
+
+if (IS_PRODUCTION && !trustProxyValue) {
+  throw new Error(
+    "TRUST_PROXY_HOPS must be explicitly configured in production.",
+  );
+}
 
 export const TRUST_PROXY_HOPS = readBoundedIntegerEnv(
   "TRUST_PROXY_HOPS",
@@ -130,7 +205,27 @@ export const TRUST_PROXY_HOPS = readBoundedIntegerEnv(
   10,
 );
 
+/*
+ * KOLA's Node server itself is HTTP.
+ *
+ * Production TLS is expected to terminate at a trusted reverse proxy.
+ * Therefore production must trust at least that proxy hop.
+ */
+if (IS_PRODUCTION && TRUST_PROXY_HOPS < 1) {
+  throw new Error("TRUST_PROXY_HOPS must be at least 1 in production.");
+}
+
+/*
+|--------------------------------------------------------------------------
+| HTTPS enforcement
+|--------------------------------------------------------------------------
+*/
+
 export const ENFORCE_HTTPS = readBooleanEnv("ENFORCE_HTTPS", IS_PRODUCTION);
+
+if (IS_PRODUCTION && !ENFORCE_HTTPS) {
+  throw new Error("ENFORCE_HTTPS cannot be disabled in production.");
+}
 
 /*
 |--------------------------------------------------------------------------
